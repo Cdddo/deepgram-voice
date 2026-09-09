@@ -1,5 +1,5 @@
 diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
-index 32d754f8bd..28363a6174 100644
+index 32d754f8bd..3d54e779e2 100644
 --- a/plugins/platforms/discord/adapter.py
 +++ b/plugins/platforms/discord/adapter.py
 @@ -161,6 +161,9 @@ _NATIVE_SLASH_COMMANDS: tuple = (
@@ -246,7 +246,32 @@ index 32d754f8bd..28363a6174 100644
                  receiver.start()
                  self._voice_receivers[guild_id] = receiver
                  self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
-@@ -4173,6 +4306,114 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+@@ -3659,9 +3792,23 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+             from tools.transcription_tools import transcribe_audio
+             result = await asyncio.to_thread(transcribe_audio, wav_path)
+             if not result.get("success"):
++                # Log the full envelope — silent returns here made a real STT
++                # outage (Deepgram hanging ~65s, empty transcripts) invisible
++                # on 2026-09-09. The branch matters: provider failure vs empty
++                # transcript vs hallucination filter have different fixes.
++                logger.warning(
++                    "Voice STT failed for user %d: %s", user_id, result)
+                 return
+             transcript = result.get("transcript", "").strip()
+-            if not transcript or is_whisper_hallucination(transcript):
++            if not transcript:
++                logger.info(
++                    "Voice STT returned empty transcript for user %d (result=%s)",
++                    user_id, result)
++                return
++            if is_whisper_hallucination(transcript):
++                logger.info(
++                    "Voice STT filtered hallucination for user %d: %r",
++                    user_id, transcript[:60])
+                 return
+             logger.info("Voice input from user %d: %s", user_id, transcript[:100])
+             if self._voice_input_callback:
+@@ -4173,6 +4320,114 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                  _handler = discord.app_commands.choices(**choices)(_handler)
          return _handler
  
@@ -361,7 +386,7 @@ index 32d754f8bd..28363a6174 100644
      def _register_thread_slash(self, tree, name: str, description: str) -> None:
          @tree.command(name=name, description=description)
          @discord.app_commands.describe(
-@@ -4246,6 +4487,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+@@ -4246,6 +4501,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
          except Exception as e:
              logger.warning("Discord auto-register from plugin commands failed: %s", e)
          self._register_skill_group(tree)
