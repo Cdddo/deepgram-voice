@@ -35,7 +35,11 @@ that are NOT upstream. They live in the ``deepgram-voice`` repo:
                                              + a proper push-to-talk mode
                                              (discord.voice_ptt_mode) that
                                              segments on SPEAKING op-5
-                                             release instead of a timer.
+                                             release instead of a timer,
+                                             with a /voicemode slash command
+                                             to show/toggle the mode live
+                                             (persists to config, applies to
+                                             running receivers, no restart).
 
 Re-apply after EVERY ``hermes update`` (updates revert uncommitted core
 edits) — procedure in that repo's patches/README-v2.md.

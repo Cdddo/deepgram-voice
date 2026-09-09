@@ -1,8 +1,18 @@
 diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
-index 32d754f8bd..4ffa322dd2 100644
+index 32d754f8bd..c9acd5cd13 100644
 --- a/plugins/platforms/discord/adapter.py
 +++ b/plugins/platforms/discord/adapter.py
-@@ -644,9 +644,32 @@ class VoiceReceiver:
+@@ -161,6 +161,9 @@ _NATIVE_SLASH_COMMANDS: tuple = (
+     ("btw", "Ask a side question about the current conversation",
+      (("question", str, _REQUIRED, "The side question to answer without interrupting", None),),
+      "/btw {question}", "Side question dispatched~"),
++    # /voicemode: template None -> registered by _register_voicemode_slash (custom handler:
++    # toggles voice input mode live, persisted to discord.voice_ptt_mode).
++    ("voicemode", "Show or toggle voice input mode (push-to-talk vs open mic)", (), None, None),
+ )
+ _DISCORD_SELECT_FIELD_LIMIT = 100
+ # Discord caps a single select menu at 25 options; a View holds at most 5 rows.
+@@ -644,9 +647,32 @@ class VoiceReceiver:
      SAMPLE_RATE = 48000        # Discord native rate
      CHANNELS = 2               # Discord sends stereo
  
@@ -36,7 +46,26 @@ index 32d754f8bd..4ffa322dd2 100644
          self._running = False
          self._secret_key: Optional[bytes] = None
          self._dave_session = None
-@@ -715,6 +738,7 @@ class VoiceReceiver:
+@@ -695,6 +721,18 @@ class VoiceReceiver:
+     def resume(self):
+         self._paused = False
+ 
++    def set_ptt_mode(self, ptt: bool) -> None:
++        """Switch PTT/open-mic live (via /voicemode). Flushes any in-flight buffer
++        first so a mid-utterance switch neither loses audio nor misapplies the old
++        mode's boundary rules to it. The caller routes the flushed audio."""
++        with self._lock:
++            was = self._ptt_mode
++            self._ptt_mode = bool(ptt)
++            self._released_at.clear()
++            self._speaking_active.clear()
++        if was != bool(ptt):
++            logger.info("VoiceReceiver mode switched: ptt=%s", ptt)
++
+     # --- SSRC -> user_id mapping via SPEAKING opcode hook ---
+ 
+     def map_ssrc(self, ssrc: int, user_id: int):
+@@ -715,6 +753,7 @@ class VoiceReceiver:
                  if ssrc and user_id:
                      logger.info("SPEAKING event: ssrc=%d -> user=%s", ssrc, user_id)
                      receiver_self.map_ssrc(int(ssrc), int(user_id))
@@ -44,7 +73,7 @@ index 32d754f8bd..4ffa322dd2 100644
              if original_hook:
                  await original_hook(ws, msg)
          conn.hook = wrapped_hook
-@@ -836,6 +860,23 @@ class VoiceReceiver:
+@@ -836,6 +875,23 @@ class VoiceReceiver:
  
      # --- Silence detection ---
  
@@ -68,7 +97,7 @@ index 32d754f8bd..4ffa322dd2 100644
      def _infer_user_for_ssrc(self, ssrc: int) -> int:
          """Infer user_id for an unmapped SSRC: after a bot rejoin Discord may not resend
          SPEAKING, so if exactly one allowed user is in the channel, map the SSRC to them."""
-@@ -859,7 +900,11 @@ class VoiceReceiver:
+@@ -859,7 +915,11 @@ class VoiceReceiver:
          return 0
  
      def check_silence(self) -> list:
@@ -81,7 +110,7 @@ index 32d754f8bd..4ffa322dd2 100644
          now = time.monotonic()
          completed = []
          with self._lock:
-@@ -871,6 +916,26 @@ class VoiceReceiver:
+@@ -871,6 +931,26 @@ class VoiceReceiver:
                  buf = self._buffers[ssrc]
                  # 48kHz, 16-bit, stereo = 192000 bytes/sec
                  buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
@@ -108,7 +137,7 @@ index 32d754f8bd..4ffa322dd2 100644
                  if silence_duration >= self.SILENCE_THRESHOLD and buf_duration >= self.MIN_SPEECH_DURATION:
                      user_id = ssrc_user_map.get(ssrc, 0)
                      if not user_id:
-@@ -894,7 +959,10 @@ class VoiceReceiver:
+@@ -894,7 +974,10 @@ class VoiceReceiver:
              for ssrc, buf in list(self._buffers.items()):
                  # 48kHz, 16-bit, stereo = 192000 bytes/sec
                  buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
@@ -120,7 +149,7 @@ index 32d754f8bd..4ffa322dd2 100644
                      user_id = ssrc_user_map.get(ssrc, 0)
                      if not user_id:
                          user_id = self._infer_user_for_ssrc(ssrc)
-@@ -902,6 +970,8 @@ class VoiceReceiver:
+@@ -902,6 +985,8 @@ class VoiceReceiver:
                          completed.append((user_id, bytes(buf)))
                  self._buffers.pop(ssrc, None)
                  self._last_packet_time.pop(ssrc, None)
@@ -129,7 +158,7 @@ index 32d754f8bd..4ffa322dd2 100644
          return completed
  
      # --- PCM -> WAV conversion (for Whisper STT) ---
-@@ -3381,7 +3451,15 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+@@ -3381,7 +3466,15 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
              if source is not None:
                  self._voice_sources[guild_id] = source
              try:
@@ -146,3 +175,119 @@ index 32d754f8bd..4ffa322dd2 100644
                  receiver.start()
                  self._voice_receivers[guild_id] = receiver
                  self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
+@@ -4173,6 +4266,107 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+                 _handler = discord.app_commands.choices(**choices)(_handler)
+         return _handler
+ 
++    def _register_voicemode_slash(self, tree) -> None:
++        """Register /voicemode: show or toggle voice input mode (PTT vs open mic)."""
++        @tree.command(name="voicemode", description="Show or toggle voice input mode (push-to-talk vs open mic)")
++        @discord.app_commands.describe(mode="ptt, open (mic), or leave empty to show the current mode")
++        async def slash_voicemode(
++            interaction: discord.Interaction, mode: str = "",
++        ):
++            await self._handle_voicemode_slash(interaction, mode)
++
++    async def _handle_voicemode_slash(
++        self, interaction: discord.Interaction, mode: str = "",
++    ) -> None:
++        """Show or toggle the voice input mode (PTT vs open mic).
++
++        Persists to ``discord.voice_ptt_mode`` via save_config_value AND applies
++        live to any running VoiceReceiver in this guild — no restart needed.
++        """
++        if not await self._check_slash_authorization(interaction, "/voicemode"):
++            return
++        deferred = await self._defer_unless_expired(
++            interaction,
++            "[Discord] /voicemode: interaction expired before defer.",
++        )
++        # Read the CURRENT mode fresh from config (config.yaml is the source of truth;
++        # the slash toggle writes it so the value survives gateway restarts).
++        current_ptt = False
++        try:
++            from hermes_cli.config import read_raw_config
++            cfg = read_raw_config() or {}
++            current_ptt = bool((cfg.get("discord") or {}).get("voice_ptt_mode", False))
++        except Exception as e:
++            logger.warning("[Discord] /voicemode: could not read config: %s", e)
++
++        requested = mode.strip().lower()
++        if requested in {"", "show", "status"}:
++            label = "push-to-talk" if current_ptt else "open mic"
++            msg = (f"Voice input mode: **{label}**\n"
++                   f"Use `/voicemode ptt` or `/voicemode open` to switch.")
++            if deferred:
++                await interaction.followup.send(msg, ephemeral=True)
++            else:
++                await interaction.response.send_message(msg, ephemeral=True)
++            return
++
++        if requested in {"ptt", "push", "push-to-talk", "push_to_talk"}:
++            new_ptt = True
++        elif requested in {"open", "mic", "open-mic", "open_mic", "voice"}:
++            new_ptt = False
++        else:
++            msg = "Unknown mode. Use `/voicemode ptt`, `/voicemode open`, or bare `/voicemode` to show current."
++            if deferred:
++                await interaction.followup.send(msg, ephemeral=True)
++            else:
++                await interaction.response.send_message(msg, ephemeral=True)
++            return
++
++        if new_ptt == current_ptt:
++            label = "push-to-talk" if new_ptt else "open mic"
++            msg = f"Already in **{label}** mode — nothing changed."
++            if deferred:
++                await interaction.followup.send(msg, ephemeral=True)
++            else:
++                await interaction.response.send_message(msg, ephemeral=True)
++            return
++
++        # Persist so the mode survives restarts.
++        try:
++            from cli import save_config_value
++            if not save_config_value("discord.voice_ptt_mode", new_ptt):
++                raise RuntimeError("save_config_value returned False")
++        except Exception as e:
++            logger.error("[Discord] /voicemode: failed to persist mode: %s", e)
++            msg = f"Failed to save the mode to config: {e}"
++            if deferred:
++                await interaction.followup.send(msg, ephemeral=True)
++            else:
++                await interaction.response.send_message(msg, ephemeral=True)
++            return
++
++        # Apply live to any running receiver in this guild (flushes in-flight
++        # audio so a mid-utterance switch doesn't lose or misroute audio).
++        applied = 0
++        guild_id = getattr(interaction, "guild_id", None)
++        if guild_id is not None:
++            receiver = self._voice_receivers.get(guild_id)
++            if receiver is not None:
++                try:
++                    receiver.set_ptt_mode(new_ptt)
++                    applied += 1
++                except Exception as e:
++                    logger.warning("[Discord] /voicemode: live-apply failed: %s", e)
++
++        label = "push-to-talk" if new_ptt else "open mic"
++        where = " (applied to the active voice session)" if applied else (
++            " (takes effect next time the bot joins a voice channel)")
++        msg = f"Voice input mode switched to **{label}**{where}."
++        if deferred:
++            await interaction.followup.send(msg, ephemeral=True)
++        else:
++            await interaction.response.send_message(msg, ephemeral=True)
++
+     def _register_thread_slash(self, tree, name: str, description: str) -> None:
+         @tree.command(name=name, description=description)
+         @discord.app_commands.describe(
+@@ -4246,6 +4440,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+         except Exception as e:
+             logger.warning("Discord auto-register from plugin commands failed: %s", e)
+         self._register_skill_group(tree)
++        self._register_voicemode_slash(tree)
+         if dropped_over_cap:
+             # One over-limit command makes Discord reject the entire sync (error 30032).
+             logger.warning(
