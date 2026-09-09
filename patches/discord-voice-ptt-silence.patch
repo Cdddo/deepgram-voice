@@ -1,5 +1,5 @@
 diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
-index 32d754f8bd..422c002b46 100644
+index 32d754f8bd..bb51fc0268 100644
 --- a/plugins/platforms/discord/adapter.py
 +++ b/plugins/platforms/discord/adapter.py
 @@ -161,6 +161,9 @@ _NATIVE_SLASH_COMMANDS: tuple = (
@@ -46,14 +46,17 @@ index 32d754f8bd..422c002b46 100644
          self._running = False
          self._secret_key: Optional[bytes] = None
          self._dave_session = None
-@@ -695,6 +721,18 @@ class VoiceReceiver:
+@@ -695,6 +721,21 @@ class VoiceReceiver:
      def resume(self):
          self._paused = False
  
 +    def set_ptt_mode(self, ptt: bool) -> None:
-+        """Switch PTT/open-mic live (via /voicemode). Flushes any in-flight buffer
-+        first so a mid-utterance switch neither loses audio nor misapplies the old
-+        mode's boundary rules to it. The caller routes the flushed audio."""
++        """Switch PTT/open-mic live (via /voicemode). Clears PTT release/speaking
++        bookkeeping so a stale release window can't fire a bogus flush after the
++        switch. Any in-flight buffer simply continues under the NEW mode's rules:
++        in PTT it completes on the next release + grace; in open-mic on the
++        silence timer. (It is deliberately NOT flushed here — mid-speech audio
++        belongs to the utterance, not to the mode switch.)"""
 +        with self._lock:
 +            was = self._ptt_mode
 +            self._ptt_mode = bool(ptt)
@@ -65,7 +68,7 @@ index 32d754f8bd..422c002b46 100644
      # --- SSRC -> user_id mapping via SPEAKING opcode hook ---
  
      def map_ssrc(self, ssrc: int, user_id: int):
-@@ -715,6 +753,7 @@ class VoiceReceiver:
+@@ -715,6 +756,7 @@ class VoiceReceiver:
                  if ssrc and user_id:
                      logger.info("SPEAKING event: ssrc=%d -> user=%s", ssrc, user_id)
                      receiver_self.map_ssrc(int(ssrc), int(user_id))
@@ -73,7 +76,7 @@ index 32d754f8bd..422c002b46 100644
              if original_hook:
                  await original_hook(ws, msg)
          conn.hook = wrapped_hook
-@@ -836,6 +875,23 @@ class VoiceReceiver:
+@@ -836,6 +878,23 @@ class VoiceReceiver:
  
      # --- Silence detection ---
  
@@ -97,7 +100,7 @@ index 32d754f8bd..422c002b46 100644
      def _infer_user_for_ssrc(self, ssrc: int) -> int:
          """Infer user_id for an unmapped SSRC: after a bot rejoin Discord may not resend
          SPEAKING, so if exactly one allowed user is in the channel, map the SSRC to them."""
-@@ -859,7 +915,11 @@ class VoiceReceiver:
+@@ -859,7 +918,11 @@ class VoiceReceiver:
          return 0
  
      def check_silence(self) -> list:
@@ -110,7 +113,7 @@ index 32d754f8bd..422c002b46 100644
          now = time.monotonic()
          completed = []
          with self._lock:
-@@ -871,6 +931,26 @@ class VoiceReceiver:
+@@ -871,6 +934,26 @@ class VoiceReceiver:
                  buf = self._buffers[ssrc]
                  # 48kHz, 16-bit, stereo = 192000 bytes/sec
                  buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
@@ -137,7 +140,7 @@ index 32d754f8bd..422c002b46 100644
                  if silence_duration >= self.SILENCE_THRESHOLD and buf_duration >= self.MIN_SPEECH_DURATION:
                      user_id = ssrc_user_map.get(ssrc, 0)
                      if not user_id:
-@@ -894,7 +974,10 @@ class VoiceReceiver:
+@@ -894,7 +977,10 @@ class VoiceReceiver:
              for ssrc, buf in list(self._buffers.items()):
                  # 48kHz, 16-bit, stereo = 192000 bytes/sec
                  buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
@@ -149,7 +152,7 @@ index 32d754f8bd..422c002b46 100644
                      user_id = ssrc_user_map.get(ssrc, 0)
                      if not user_id:
                          user_id = self._infer_user_for_ssrc(ssrc)
-@@ -902,6 +985,8 @@ class VoiceReceiver:
+@@ -902,6 +988,8 @@ class VoiceReceiver:
                          completed.append((user_id, bytes(buf)))
                  self._buffers.pop(ssrc, None)
                  self._last_packet_time.pop(ssrc, None)
@@ -158,7 +161,7 @@ index 32d754f8bd..422c002b46 100644
          return completed
  
      # --- PCM -> WAV conversion (for Whisper STT) ---
-@@ -3381,7 +3466,15 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+@@ -3381,7 +3469,15 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
              if source is not None:
                  self._voice_sources[guild_id] = source
              try:
@@ -175,7 +178,7 @@ index 32d754f8bd..422c002b46 100644
                  receiver.start()
                  self._voice_receivers[guild_id] = receiver
                  self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
-@@ -4173,6 +4266,114 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+@@ -4173,6 +4269,114 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                  _handler = discord.app_commands.choices(**choices)(_handler)
          return _handler
  
@@ -265,8 +268,8 @@ index 32d754f8bd..422c002b46 100644
 +                await interaction.response.send_message(msg, ephemeral=True)
 +            return
 +
-+        # Apply live to any running receiver in this guild (flushes in-flight
-+        # audio so a mid-utterance switch doesn't lose or misroute audio).
++        # Apply live to any running receiver in this guild. In-flight audio
++        # continues under the new mode's rules (no flush — see set_ptt_mode).
 +        applied = 0
 +        guild_id = getattr(interaction, "guild_id", None)
 +        if guild_id is not None:
@@ -290,7 +293,7 @@ index 32d754f8bd..422c002b46 100644
      def _register_thread_slash(self, tree, name: str, description: str) -> None:
          @tree.command(name=name, description=description)
          @discord.app_commands.describe(
-@@ -4246,6 +4447,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+@@ -4246,6 +4450,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
          except Exception as e:
              logger.warning("Discord auto-register from plugin commands failed: %s", e)
          self._register_skill_group(tree)
