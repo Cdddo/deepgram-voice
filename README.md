@@ -36,7 +36,7 @@ gap is accepted — renderer sandbox can't reach the Python plugin registry).
 ## Reapply core patches after hermes update
 
 ```bash
-cd C:/Users/tenta/AppData/Local/hermes/hermes-agent
+cd ~/.hermes/hermes-agent   # Windows: %LOCALAPPDATA%/hermes/hermes-agent
 git apply --check patches/core-combined-v2-postsplit.patch
 git apply patches/core-combined-v2-postsplit.patch
 ```

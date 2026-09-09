@@ -19,7 +19,7 @@
   speak_stream_ws (+ forced plugin discovery in _resolve) + inert helpers.ts stub.
 
 ## Restore after hermes update
-    cd C:/Users/tenta/AppData/Local/hermes/hermes-agent
+    cd ~/.hermes/hermes-agent   # Windows: %LOCALAPPDATA%/hermes/hermes-agent
     git apply --check patches/core-combined-v2-postsplit.patch   # from this dir
     git apply patches/core-combined-v2-postsplit.patch
 If --check fails: upstream moved the code again. Do NOT 3-way apply blindly (file
