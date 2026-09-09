@@ -1,0 +1,11 @@
+name: deepgram
+id: tts/deepgram
+kind: backend
+version: 1.0.0
+description: >-
+  Deepgram Flux TTS (flux-*-en) via /v2/speak. Default voice flux-colin-en
+  (British male). Free through 2026-09-12; $0.0450/1k chars after. Voice is
+  fully configurable via tts.deepgram.voice.
+author: Atlas
+requires_env:
+  - DEEPGRAM_API_KEY

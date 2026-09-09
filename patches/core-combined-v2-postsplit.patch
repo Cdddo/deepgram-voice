@@ -1,0 +1,354 @@
+diff --git a/apps/desktop/src/app/settings/helpers.ts b/apps/desktop/src/app/settings/helpers.ts
+index b51162f854..6b5b6171d5 100644
+--- a/apps/desktop/src/app/settings/helpers.ts
++++ b/apps/desktop/src/app/settings/helpers.ts
+@@ -339,6 +339,27 @@ function commandProviderNames(config: HermesConfigRecord, section: 'tts' | 'stt'
+   return [...names]
+ }
+ 
++// Plugin-registered TTS/STT provider names from
++// `~/.hermes/plugins/tts/<name>/` and `~/.hermes/plugins/transcription/<name>/`.
++//
++// NOTE: intentionally NOT wired into the desktop settings dropdown.
++// The desktop renderer runs in a sandboxed Electron context with no
++// `nodeIntegration` and no access to the Python `agent.*_registry`
++// modules. Calling `list_providers()` from the renderer is not
++// possible without a deliberate IPC capability (see
++// `apps/desktop/AGENTS.md` — "renderer never reaches for Node").
++// Plugin-registered providers therefore surface only in the CLI
++// picker (`hermes_cli.tools_config._plugin_tts_providers`), which
++// runs in the gateway and has full Python access. The desktop
++// dropdown instead reads `tts.providers.*` / `stt.providers.*`
++// command-type blocks via `commandProviderNames()` (the same path
++// the Fish TTS provider uses). User-installed providers that want
++// to appear in the desktop dropdown should declare a command block
++// in `config.yaml`, not register via the plugin API.
++function _pluginProviderNames(_section: 'tts' | 'stt'): string[] {
++  return []
++}
++
+ // Voice sets per OpenAI speech model, per the OpenAI TTS API docs: tts-1 and
+ // tts-1-hd support 9 voices; gpt-4o-mini-tts supports those plus ballad,
+ // verse, marin, and cedar (13 total). Unknown/future models get the full
+diff --git a/hermes_cli/web_routers/audio.py b/hermes_cli/web_routers/audio.py
+index ec49c90467..8eba48c929 100644
+--- a/hermes_cli/web_routers/audio.py
++++ b/hermes_cli/web_routers/audio.py
+@@ -371,6 +371,17 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
+     loop = asyncio.get_running_loop()
+ 
+     def _resolve():
++        # Plugin streamers (e.g. Deepgram Flux) register into
++        # tools.tts_streaming._REGISTRY from their plugin entry point.
++        # The web-server process does not always call discover_plugins()
++        # before the first speak-stream connect, so force it here —
++        # idempotent, cheap after the first call.
++        try:
++            from hermes_cli.plugins import _ensure_plugins_discovered
++
++            _ensure_plugins_discovered()
++        except Exception:
++            pass
+         from tools.tts_streaming import resolve_streaming_provider
+         from tools.tts_tool import _get_provider, _load_tts_config, _resolve_max_text_length
+         with _config_profile_scope(profile):
+@@ -402,6 +413,76 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
+         from tools.tts_streaming import SentenceChunker
+         from tools.tts_text_normalize import _strip_markdown_for_tts
+ 
++        # Incremental providers (Deepgram Flux) get deltas forwarded in real
++        # time — no sentence chopping, no idle wait. The server emits audio
++        # the moment it has enough text.
++        if getattr(streamer, "supports_streaming", False):
++            try:
++                streamer.open_session()
++            except Exception as exc:
++                _log.warning("speak-stream open_session failed: %s", exc)
++                loop.call_soon_threadsafe(chunks.put_nowait, None)
++                return
++
++            def _drain_available(timeout: float = 0.0) -> None:
++                try:
++                    for chunk in streamer.iter_audio(timeout=timeout):
++                        if stop.is_set():
++                            return
++                        loop.call_soon_threadsafe(chunks.put_nowait, chunk)
++                except Exception as exc:
++                    _log.debug("speak-stream drain failed: %s", exc)
++
++            # Background drain thread: keeps pulling audio while the producer
++            # feeds text. Without this, audio that arrives between LLM deltas
++            # sits in the streamer's queue until the next feed() call.
++            drain_stop = threading.Event()
++
++            def _drain_loop() -> None:
++                while not drain_stop.is_set() and not stop.is_set():
++                    _drain_available(timeout=0.05)
++                    done = getattr(streamer, "_session_done", None)
++                    if done is not None and done.is_set():
++                        _drain_available(timeout=0.0)
++                        break
++
++            drain_thread = threading.Thread(target=_drain_loop, daemon=True)
++            drain_thread.start()
++            try:
++                while not stop.is_set():
++                    try:
++                        delta = text_q.get(timeout=0.5)
++                    except queue.Empty:
++                        continue
++                    if delta is None:
++                        try:
++                            streamer.flush()
++                        except Exception as exc:
++                            _log.debug("speak-stream flush failed: %s", exc)
++                        # Wait for server to finish synthesizing.
++                        done = getattr(streamer, "_session_done", None)
++                        if done is not None:
++                            done.wait(timeout=30.0)
++                        break
++                    cleaned = _strip_markdown_for_tts(delta)
++                    if cleaned:
++                        try:
++                            streamer.feed(cleaned)
++                        except Exception as exc:
++                            _log.warning("speak-stream feed failed: %s", exc)
++                            break
++            finally:
++                drain_stop.set()
++                drain_thread.join(timeout=5.0)
++                try:
++                    streamer.close_session()
++                except Exception as exc:
++                    _log.debug("speak-stream close_session failed: %s", exc)
++                loop.call_soon_threadsafe(chunks.put_nowait, None)
++            return
++
++        # One-shot path: sentence-chunk + stream(text) per sentence.
++        # Used by ElevenLabs / OpenAI / xAI / Gemini.
+         chunker = SentenceChunker()
+ 
+         # The session stays open for a whole agent turn and no text arrives
+diff --git a/tools/tts_streaming.py b/tools/tts_streaming.py
+index 70eab8e62f..149ca8c437 100644
+--- a/tools/tts_streaming.py
++++ b/tools/tts_streaming.py
+@@ -96,11 +96,29 @@ class SentenceChunker:
+ 
+ 
+ class StreamingTTSProvider(ABC):
+-    """Yields raw int16, little-endian, mono PCM chunks at ``sample_rate`` (built-ins: 24 kHz)."""
++    """Yields raw int16, little-endian, mono PCM chunks at ``sample_rate`` (built-ins: 24 kHz).
++
++    Two operating modes (a provider picks ONE):
++
++    1. **One-shot** (the default — backwards-compatible): the dispatcher buffers a chunk of
++       text and calls ``stream(text)`` once. The provider yields PCM chunks for that text and
++       returns. Used by ElevenLabs, OpenAI, xAI, Gemini.
++
++    2. **Incremental** (``supports_streaming = True``): the dispatcher keeps the provider
++       session open for the whole reply, calling ``feed(delta)`` as LLM tokens arrive and
++       ``iter_audio()`` to drain PCM. The provider manages its own connection lifecycle
++       (``open_session`` / ``close_session``). Lowest-latency shape — audio emits the moment
++       enough text arrives, with no idle wait or sentence-boundary chopping. Used by Deepgram
++       Flux.
++    """
+ 
+     sample_rate: int = 24000
+     channels: int = 1
+     sample_width: int = 2  # bytes/sample (int16)
++    # If True, the dispatcher drives the provider incrementally via
++    # feed()/iter_audio() instead of buffering text and calling
++    # stream() per sentence chunk.
++    supports_streaming: bool = False
+ 
+     def __init__(self, tts_config: Dict, section: Dict):
+         self.tts_config = tts_config
+@@ -113,7 +131,57 @@ class StreamingTTSProvider(ABC):
+ 
+     @abstractmethod
+     def stream(self, text: str) -> Iterator[bytes]:
+-        """Yield PCM chunks for ``text``. Raise on failure (caller logs)."""
++        """Yield PCM chunks for ``text``. Raise on failure (caller logs).
++
++        This is the one-shot path. For incremental providers
++        (``supports_streaming = True``) it may either be unimplemented
++        (raise NotImplementedError) or implement a degenerate
++        single-call variant.
++        """
++
++    # --- Incremental protocol (only when supports_streaming = True) --------
++
++    def open_session(self) -> None:
++        """Open a long-lived provider session.
++
++        Called once before any feed()/iter_audio() calls. Default raises
++        NotImplementedError; incremental providers must override.
++        """
++        raise NotImplementedError(
++            f"{type(self).__name__} does not support incremental streaming"
++        )
++
++    def feed(self, text_delta: str) -> None:
++        """Push an LLM text delta into the open session.
++
++        Called zero or more times between open_session() and
++        close_session(). Default raises NotImplementedError; incremental
++        providers must override.
++        """
++        raise NotImplementedError(
++            f"{type(self).__name__} does not support incremental feed()"
++        )
++
++    def iter_audio(self, timeout: float = 0.0) -> Iterator[bytes]:
++        """Yield any PCM chunks currently available in the open session.
++
++        Non-blocking when ``timeout`` is 0.0; may block up to ``timeout``
++        seconds waiting for the next chunk otherwise. Default raises
++        NotImplementedError; incremental providers must override.
++        """
++        raise NotImplementedError(
++            f"{type(self).__name__} does not support incremental iter_audio()"
++        )
++
++    def close_session(self) -> None:
++        """Close the long-lived provider session.
++
++        Called once after the last feed(). Default raises
++        NotImplementedError; incremental providers must override.
++        """
++        raise NotImplementedError(
++            f"{type(self).__name__} does not support incremental close_session()"
++        )
+ 
+ 
+ _REGISTRY: Dict[str, type[StreamingTTSProvider]] = {}
+diff --git a/tools/tts_tool_speaker.py b/tools/tts_tool_speaker.py
+index 2d05938a7e..a7024bae28 100644
+--- a/tools/tts_tool_speaker.py
++++ b/tools/tts_tool_speaker.py
+@@ -274,6 +274,70 @@ class _StreamerPlayback:
+             t.join(timeout=10.0)
+         self.close_output_stream()
+ 
++    # --- Incremental-provider support (e.g. Deepgram Flux) -----------------
++    # supports_streaming providers are driven feed()/iter_audio() style: the
++    # dispatcher forwards LLM deltas to the streamer and a drain thread pulls
++    # PCM into per-turn sentence queues so the existing playback worker plays
++    # them in order. No sentence chopping, no idle wait.
++
++    def open_incremental(self) -> None:
++        """Open the streamer's long-lived session; raises on failure."""
++        self.streamer.open_session()
++
++    def feed(self, text_delta: str) -> None:
++        """Forward one LLM delta to the streamer."""
++        self.streamer.feed(text_delta)
++
++    def start_incremental_drain(self) -> None:
++        """Begin draining audio from the open session into a new sentence queue."""
++        self._prefetch_sem.acquire()
++        chunk_queue: "queue.Queue[Optional[bytes]]" = queue.Queue(maxsize=self._CHUNK_QUEUE_MAX)
++        self._audio_queue.put(chunk_queue)
++        self._prefetch_threads.append(threading.Thread(
++            target=self._consume_incremental, args=(chunk_queue,), daemon=True))
++        self._prefetch_threads[-1].start()
++
++    def _consume_incremental(self, chunk_queue: "queue.Queue[Optional[bytes]]") -> None:
++        try:
++            while not self.stop_event.is_set():
++                try:
++                    for chunk in self.streamer.iter_audio(timeout=0.02):
++                        chunk_queue.put(chunk, timeout=30.0)
++                except Exception as exc:
++                    logger.debug("streamer.iter_audio failed: %s", exc)
++                    break
++                session_done = bool(
++                    getattr(self.streamer, "_session_done", None) is not None
++                    and self.streamer._session_done.is_set()
++                )
++                if session_done:
++                    # Producer flushed + closed. Let the queue drain before the
++                    # sentinel so playback doesn't cut off the last frames.
++                    while not chunk_queue.empty() and not self.stop_event.is_set():
++                        threading.Event().wait(0.01)
++                    break
++        except Exception as exc:
++            logger.debug("incremental drain failed: %s", exc)
++        finally:
++            chunk_queue.put(None)  # sentinel
++            self._prefetch_sem.release()
++
++    def close_incremental(self) -> None:
++        """Flush and close the streamer's session, then wait for playback."""
++        try:
++            self.streamer.flush()
++        except Exception as exc:
++            logger.debug("streamer.flush failed: %s", exc)
++        # Wait up to 30s for the provider to finish synthesizing before
++        # closing — closing too early cuts off the last audio frames.
++        done = getattr(self.streamer, "_session_done", None)
++        if done is not None:
++            done.wait(timeout=30.0)
++        try:
++            self.streamer.close_session()
++        except Exception as exc:
++            logger.debug("streamer.close_session failed: %s", exc)
++
+ 
+ def stream_tts_to_speaker(
+     text_queue: queue.Queue, stop_event: threading.Event, tts_done_event: threading.Event,
+@@ -305,6 +369,53 @@ def stream_tts_to_speaker(
+         chunker = SentenceChunker()
+         spoken_sentences: list[str] = []  # skip duplicate/near-duplicate sentences (LLM repetition)
+ 
++        # --- Incremental streamer branch (e.g. Deepgram Flux) ---------------
++        # supports_streaming providers are driven feed()/iter_audio() style:
++        # deltas forwarded in real time, audio drained as it arrives. No
++        # sentence chopping, no idle wait. Time-to-first-audio is bounded by
++        # (LLM delta interval) + (one WS round-trip) instead of reply length.
++        if streamer is not None and getattr(streamer, "supports_streaming", False):
++            try:
++                playback.open_incremental()
++            except Exception as exc:
++                logger.warning("Incremental TTS open_session failed: %s", exc)
++                playback.finish()
++                tts_done_event.set()
++                return
++            playback.start_incremental_drain()
++
++            def _inc_producer() -> None:
++                """Forward LLM deltas to the streamer; flush+close on end-of-text."""
++                try:
++                    while not stop_event.is_set():
++                        try:
++                            delta = text_queue.get(timeout=0.5)
++                        except queue.Empty:
++                            continue
++                        if delta is None:
++                            playback.close_incremental()
++                            break
++                        cleaned = _strip_markdown_for_tts(delta)
++                        if cleaned:
++                            try:
++                                playback.feed(cleaned)
++                            except Exception as exc:
++                                logger.warning("streamer.feed failed: %s", exc)
++                                break
++                finally:
++                    playback.finish()
++
++            _inc_producer_thread = threading.Thread(target=_inc_producer, daemon=True)
++            _inc_producer_thread.start()
++            # Join the producer before returning: its finally runs
++            # playback.finish(), which waits for the playback worker to drain
++            # every queued chunk. Only then does the outer finally set
++            # tts_done_event — otherwise continuous voice mode reopens the mic
++            # over its own voice.
++            _inc_producer_thread.join(timeout=600.0)
++            return
++        # ---------------------------------------------------------------------
++
+         def _speak_sentence(sentence: str) -> None:
+             if stop_event.is_set():
+                 return

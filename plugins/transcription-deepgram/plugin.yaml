@@ -1,0 +1,11 @@
+name: deepgram
+id: transcription/deepgram
+kind: backend
+version: 1.0.0
+description: >-
+  Deepgram Flux Multilingual STT (flux-general-multi). Conversational-grade
+  transcription via /v2/listen WebSocket. $0.0078/min — $200 credits ≈ 14 months
+  of 1hr/day walks.
+author: Atlas
+requires_env:
+  - DEEPGRAM_API_KEY
