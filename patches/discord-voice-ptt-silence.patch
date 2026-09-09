@@ -1,5 +1,5 @@
 diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
-index 32d754f8bd..bb51fc0268 100644
+index 32d754f8bd..b7500b1668 100644
 --- a/plugins/platforms/discord/adapter.py
 +++ b/plugins/platforms/discord/adapter.py
 @@ -161,6 +161,9 @@ _NATIVE_SLASH_COMMANDS: tuple = (
@@ -12,7 +12,7 @@ index 32d754f8bd..bb51fc0268 100644
  )
  _DISCORD_SELECT_FIELD_LIMIT = 100
  # Discord caps a single select menu at 25 options; a View holds at most 5 rows.
-@@ -644,9 +647,32 @@ class VoiceReceiver:
+@@ -644,9 +647,38 @@ class VoiceReceiver:
      SAMPLE_RATE = 48000        # Discord native rate
      CHANNELS = 2               # Discord sends stereo
  
@@ -37,6 +37,12 @@ index 32d754f8bd..bb51fc0268 100644
 +        # PTT tail grace: after key release, wait this long for in-flight/reordered
 +        # UDP packets before flushing the buffer.
 +        self.PTT_TAIL_GRACE = 0.25
++        # PTT race recovery: when the release SPEAKING event is missed, synthesize
++        # a release once the packet stream has been silent this long (Discord
++        # stops sending RTP while the key is up, so a sustained gap IS a release).
++        # Set above the open-mic threshold so normal speech pauses (thinking,
++        # breathing) don't synthesize a release in a genuinely-held-key scenario.
++        self.PTT_SYNTH_RELEASE_GAP = 2.0
 +        # PTT stale discard: a buffer that never got a release event (bot missed the
 +        # SPEAKING=0, ghost SSRC) is dropped after this much quiet.
 +        self.PTT_STALE_SECONDS = 120.0
@@ -46,7 +52,7 @@ index 32d754f8bd..bb51fc0268 100644
          self._running = False
          self._secret_key: Optional[bytes] = None
          self._dave_session = None
-@@ -695,6 +721,21 @@ class VoiceReceiver:
+@@ -695,6 +727,21 @@ class VoiceReceiver:
      def resume(self):
          self._paused = False
  
@@ -68,7 +74,7 @@ index 32d754f8bd..bb51fc0268 100644
      # --- SSRC -> user_id mapping via SPEAKING opcode hook ---
  
      def map_ssrc(self, ssrc: int, user_id: int):
-@@ -715,6 +756,7 @@ class VoiceReceiver:
+@@ -715,6 +762,7 @@ class VoiceReceiver:
                  if ssrc and user_id:
                      logger.info("SPEAKING event: ssrc=%d -> user=%s", ssrc, user_id)
                      receiver_self.map_ssrc(int(ssrc), int(user_id))
@@ -76,7 +82,29 @@ index 32d754f8bd..bb51fc0268 100644
              if original_hook:
                  await original_hook(ws, msg)
          conn.hook = wrapped_hook
-@@ -836,6 +878,23 @@ class VoiceReceiver:
+@@ -828,6 +876,21 @@ class VoiceReceiver:
+             with self._lock:
+                 self._buffers[ssrc].extend(pcm)
+                 self._last_packet_time[ssrc] = time.monotonic()
++            # PTT race recovery: if this SSRC has no user binding yet, the
++            # SPEAKING press event was likely lost (hook installs after
++            # connect() returns — events in that gap never reach us). Bind
++            # eagerly and synthesize the key-held state so the utterance
++            # segments on the next packet gap instead of sitting in the
++            # buffer until the 120s stale discard. Inference only succeeds
++            # for a sole allowed member; otherwise wait for SPEAKING.
++            if self._ptt_mode and ssrc not in self._ssrc_to_user:
++                uid = self._infer_user_for_ssrc(ssrc)
++                if uid:
++                    logger.info(
++                        "PTT race recovery: bound ssrc=%d -> user=%d on first packet (SPEAKING event missed)",
++                        ssrc, uid)
++                    with self._lock:
++                        self._speaking_active[ssrc] = True
+         except Exception as e:
+             with self._lock:
+                 self._decoders.pop(ssrc, None)
+@@ -836,6 +899,23 @@ class VoiceReceiver:
  
      # --- Silence detection ---
  
@@ -100,7 +128,7 @@ index 32d754f8bd..bb51fc0268 100644
      def _infer_user_for_ssrc(self, ssrc: int) -> int:
          """Infer user_id for an unmapped SSRC: after a bot rejoin Discord may not resend
          SPEAKING, so if exactly one allowed user is in the channel, map the SSRC to them."""
-@@ -859,7 +918,11 @@ class VoiceReceiver:
+@@ -859,7 +939,11 @@ class VoiceReceiver:
          return 0
  
      def check_silence(self) -> list:
@@ -113,18 +141,32 @@ index 32d754f8bd..bb51fc0268 100644
          now = time.monotonic()
          completed = []
          with self._lock:
-@@ -871,6 +934,26 @@ class VoiceReceiver:
+@@ -871,6 +955,40 @@ class VoiceReceiver:
                  buf = self._buffers[ssrc]
                  # 48kHz, 16-bit, stereo = 192000 bytes/sec
                  buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
 +                if self._ptt_mode:
++                    # Race recovery: if we believe the key is held (synthesized
++                    # or event-tracked) but the packet stream stopped for
++                    # PTT_SYNTH_RELEASE_GAP, the release event was lost —
++                    # Discord stops RTP when the key goes up. Synthesize the
++                    # release so the normal flush path fires this pass.
++                    if (self._speaking_active.get(ssrc)
++                            and silence_duration >= self.PTT_SYNTH_RELEASE_GAP):
++                        self._released_at[ssrc] = last_time
++                        self._speaking_active[ssrc] = False
++                        logger.info(
++                            "PTT: no release event but packet gap %.1fs — synthesizing release for ssrc=%d",
++                            silence_duration, ssrc)
 +                    released_at = self._released_at.get(ssrc)
-+                    # Flush once: release seen AND tail grace elapsed (packets that
-+                    # arrive after release still extend the buffer — _last_packet_time
-+                    # moves, so re-check grace against last packet, not wall clock).
++                    # Flush once: release boundary seen AND tail grace elapsed
++                    # since the boundary. Grace is measured against the LATER of
++                    # (release event, last packet): op-5 release may arrive
++                    # before OR after the final RTP packet, and late packets
++                    # must extend the flush window either way.
++                    grace_anchor = max(released_at or 0.0, last_time)
 +                    if (released_at is not None
-+                            and last_time >= released_at
-+                            and now - last_time >= self.PTT_TAIL_GRACE):
++                            and now - grace_anchor >= self.PTT_TAIL_GRACE):
 +                        user_id = ssrc_user_map.get(ssrc, 0) or self._infer_user_for_ssrc(ssrc)
 +                        if user_id:
 +                            completed.append((user_id, bytes(buf)))
@@ -140,7 +182,7 @@ index 32d754f8bd..bb51fc0268 100644
                  if silence_duration >= self.SILENCE_THRESHOLD and buf_duration >= self.MIN_SPEECH_DURATION:
                      user_id = ssrc_user_map.get(ssrc, 0)
                      if not user_id:
-@@ -894,7 +977,10 @@ class VoiceReceiver:
+@@ -894,7 +1012,10 @@ class VoiceReceiver:
              for ssrc, buf in list(self._buffers.items()):
                  # 48kHz, 16-bit, stereo = 192000 bytes/sec
                  buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
@@ -152,7 +194,7 @@ index 32d754f8bd..bb51fc0268 100644
                      user_id = ssrc_user_map.get(ssrc, 0)
                      if not user_id:
                          user_id = self._infer_user_for_ssrc(ssrc)
-@@ -902,6 +988,8 @@ class VoiceReceiver:
+@@ -902,6 +1023,8 @@ class VoiceReceiver:
                          completed.append((user_id, bytes(buf)))
                  self._buffers.pop(ssrc, None)
                  self._last_packet_time.pop(ssrc, None)
@@ -161,7 +203,7 @@ index 32d754f8bd..bb51fc0268 100644
          return completed
  
      # --- PCM -> WAV conversion (for Whisper STT) ---
-@@ -3381,7 +3469,15 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+@@ -3381,7 +3504,15 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
              if source is not None:
                  self._voice_sources[guild_id] = source
              try:
@@ -178,7 +220,7 @@ index 32d754f8bd..bb51fc0268 100644
                  receiver.start()
                  self._voice_receivers[guild_id] = receiver
                  self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
-@@ -4173,6 +4269,114 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+@@ -4173,6 +4304,114 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                  _handler = discord.app_commands.choices(**choices)(_handler)
          return _handler
  
@@ -293,7 +335,7 @@ index 32d754f8bd..bb51fc0268 100644
      def _register_thread_slash(self, tree, name: str, description: str) -> None:
          @tree.command(name=name, description=description)
          @discord.app_commands.describe(
-@@ -4246,6 +4450,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+@@ -4246,6 +4485,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
          except Exception as e:
              logger.warning("Discord auto-register from plugin commands failed: %s", e)
          self._register_skill_group(tree)
