@@ -1,5 +1,5 @@
 diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
-index 32d754f8bd..c9acd5cd13 100644
+index 32d754f8bd..422c002b46 100644
 --- a/plugins/platforms/discord/adapter.py
 +++ b/plugins/platforms/discord/adapter.py
 @@ -161,6 +161,9 @@ _NATIVE_SLASH_COMMANDS: tuple = (
@@ -175,12 +175,19 @@ index 32d754f8bd..c9acd5cd13 100644
                  receiver.start()
                  self._voice_receivers[guild_id] = receiver
                  self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
-@@ -4173,6 +4266,107 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+@@ -4173,6 +4266,114 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                  _handler = discord.app_commands.choices(**choices)(_handler)
          return _handler
  
 +    def _register_voicemode_slash(self, tree) -> None:
-+        """Register /voicemode: show or toggle voice input mode (PTT vs open mic)."""
++        """Register /voicemode: show or toggle voice input mode (PTT vs open mic).
++
++        Idempotent: the reconnect loop calls _register_slash_commands() again on
++        every retry against the SAME tree object — a bare tree.command() would
++        raise CommandAlreadyRegistered and abort the reconnect."""
++        existing = {getattr(c, "name", "") for c in tree.get_commands()}
++        if "voicemode" in existing:
++            return
 +        @tree.command(name="voicemode", description="Show or toggle voice input mode (push-to-talk vs open mic)")
 +        @discord.app_commands.describe(mode="ptt, open (mic), or leave empty to show the current mode")
 +        async def slash_voicemode(
@@ -283,7 +290,7 @@ index 32d754f8bd..c9acd5cd13 100644
      def _register_thread_slash(self, tree, name: str, description: str) -> None:
          @tree.command(name=name, description=description)
          @discord.app_commands.describe(
-@@ -4246,6 +4440,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+@@ -4246,6 +4447,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
          except Exception as e:
              logger.warning("Discord auto-register from plugin commands failed: %s", e)
          self._register_skill_group(tree)
