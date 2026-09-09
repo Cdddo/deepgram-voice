@@ -9,6 +9,48 @@ transcript assembled from ``TurnInfo`` events.
 
 Default model: ``flux-general-multi`` (10 languages + optional
 ``language_hint``). English-only alternative: ``flux-general-en``.
+
+=======================================================================
+UPSTREAM PATCHES — this plugin DEPENDS on local hermes-agent core edits
+=======================================================================
+The full incremental voice pipeline (Flux STT **and** the matching TTS
+plugin in ``~/.hermes/plugins/tts/deepgram/``) requires core changes
+that are NOT upstream. They live in the ``deepgram-voice`` repo:
+
+    E:/Projects/Hermes Plugins/deepgram-voice/patches/
+        core-combined-v2-postsplit.patch   — incremental streaming TTS protocol
+                                             (StreamingTTSProvider
+                                             supports_streaming/open_session/
+                                             feed/iter_audio/close_session +
+                                             drain path in tts_tool_speaker.py
+                                             and web_routers/audio.py)
+        discord-voice-ptt-silence.patch    — Discord voice utterance
+                                             segmentation: VoiceReceiver
+                                             SILENCE_THRESHOLD was hardcoded
+                                             at 1.5s and chopped every pause
+                                             longer than itself; now
+                                             config-driven
+                                             (discord.voice_silence_duration,
+                                             discord.voice_min_speech_duration)
+                                             + a proper push-to-talk mode
+                                             (discord.voice_ptt_mode) that
+                                             segments on SPEAKING op-5
+                                             release instead of a timer.
+
+Re-apply after EVERY ``hermes update`` (updates revert uncommitted core
+edits) — procedure in that repo's patches/README-v2.md.
+
+TODO(upstream): the right fix is upstream, not patches —
+    1. Promote the incremental streamer protocol into
+       tools/tts_streaming.py proper (it is a generic provider shape,
+       not Deepgram-specific).
+    2. Make the Discord VoiceReceiver silence/segmentation params
+       config-driven and PTT-aware (segment on SPEAKING transitions;
+       a wall-clock silence timer is wrong for push-to-talk).
+Both are small, behavior-additive changes worth PRing to
+NousResearch/hermes-agent. Until they land, this plugin + the patch
+files are the source of truth.
+=======================================================================
 """
 
 from __future__ import annotations

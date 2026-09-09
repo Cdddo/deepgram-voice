@@ -1,0 +1,148 @@
+diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
+index 32d754f8bd..4ffa322dd2 100644
+--- a/plugins/platforms/discord/adapter.py
++++ b/plugins/platforms/discord/adapter.py
+@@ -644,9 +644,32 @@ class VoiceReceiver:
+     SAMPLE_RATE = 48000        # Discord native rate
+     CHANNELS = 2               # Discord sends stereo
+ 
+-    def __init__(self, voice_client, allowed_user_ids: set = None):
++    def __init__(self, voice_client, allowed_user_ids: set = None,
++                 silence_threshold: float = None, min_speech_duration: float = None,
++                 ptt_mode: bool = False):
+         self._vc = voice_client
+         self._allowed_user_ids = allowed_user_ids or set()
++        # Utterance cut timing: config-overridable (discord.voice_silence_threshold /
++        # discord.voice_min_speech_duration), class defaults otherwise. 1.5s of quiet
++        # is shorter than many natural mid-sentence pauses — lengthen to avoid
++        # chopped utterances.
++        self.SILENCE_THRESHOLD = (
++            float(silence_threshold) if silence_threshold else self.SILENCE_THRESHOLD)
++        self.MIN_SPEECH_DURATION = (
++            float(min_speech_duration) if min_speech_duration else self.MIN_SPEECH_DURATION)
++        # Push-to-talk mode: utterance boundaries come from Discord SPEAKING (op 5)
++        # key press/release transitions, NOT the silence timer. In PTT the 1.5s
++        # "silence = done" rule is wrong — it chops every pause longer than itself.
++        self._ptt_mode = bool(ptt_mode)
++        # PTT tail grace: after key release, wait this long for in-flight/reordered
++        # UDP packets before flushing the buffer.
++        self.PTT_TAIL_GRACE = 0.25
++        # PTT stale discard: a buffer that never got a release event (bot missed the
++        # SPEAKING=0, ghost SSRC) is dropped after this much quiet.
++        self.PTT_STALE_SECONDS = 120.0
++        # Per-SSRC speaking state + release timestamps (ptt_mode bookkeeping).
++        self._speaking_active: Dict[int, bool] = {}
++        self._released_at: Dict[int, float] = {}
+         self._running = False
+         self._secret_key: Optional[bytes] = None
+         self._dave_session = None
+@@ -715,6 +738,7 @@ class VoiceReceiver:
+                 if ssrc and user_id:
+                     logger.info("SPEAKING event: ssrc=%d -> user=%s", ssrc, user_id)
+                     receiver_self.map_ssrc(int(ssrc), int(user_id))
++                    receiver_self.on_speaking_event(int(ssrc), bool(data.get("speaking")))
+             if original_hook:
+                 await original_hook(ws, msg)
+         conn.hook = wrapped_hook
+@@ -836,6 +860,23 @@ class VoiceReceiver:
+ 
+     # --- Silence detection ---
+ 
++    def on_speaking_event(self, ssrc: int, speaking: bool) -> None:
++        """Track SPEAKING op-5 transitions. In PTT mode a release (speaking=False)
++        marks the utterance boundary; check_silence flushes after the tail grace."""
++        if not self._ptt_mode:
++            return
++        now = time.monotonic()
++        with self._lock:
++            was = self._speaking_active.get(ssrc, False)
++            self._speaking_active[ssrc] = speaking
++            if was and not speaking:
++                # Key released: start the tail-grace window.
++                self._released_at[ssrc] = now
++                logger.info("PTT release: ssrc=%d (flush after %.2fs grace)", ssrc, self.PTT_TAIL_GRACE)
++            elif speaking:
++                # New press: cancel any pending release window.
++                self._released_at.pop(ssrc, None)
++
+     def _infer_user_for_ssrc(self, ssrc: int) -> int:
+         """Infer user_id for an unmapped SSRC: after a bot rejoin Discord may not resend
+         SPEAKING, so if exactly one allowed user is in the channel, map the SSRC to them."""
+@@ -859,7 +900,11 @@ class VoiceReceiver:
+         return 0
+ 
+     def check_silence(self) -> list:
+-        """Return list of (user_id, pcm_bytes) for completed utterances."""
++        """Return list of (user_id, pcm_bytes) for completed utterances.
++
++        PTT mode: flush a buffer after its SPEAKING release + PTT_TAIL_GRACE (the
++        silence timer is ignored — pauses while the key is held are mid-utterance).
++        Open-mic mode: flush after SILENCE_THRESHOLD of quiet (original behavior)."""
+         now = time.monotonic()
+         completed = []
+         with self._lock:
+@@ -871,6 +916,26 @@ class VoiceReceiver:
+                 buf = self._buffers[ssrc]
+                 # 48kHz, 16-bit, stereo = 192000 bytes/sec
+                 buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
++                if self._ptt_mode:
++                    released_at = self._released_at.get(ssrc)
++                    # Flush once: release seen AND tail grace elapsed (packets that
++                    # arrive after release still extend the buffer — _last_packet_time
++                    # moves, so re-check grace against last packet, not wall clock).
++                    if (released_at is not None
++                            and last_time >= released_at
++                            and now - last_time >= self.PTT_TAIL_GRACE):
++                        user_id = ssrc_user_map.get(ssrc, 0) or self._infer_user_for_ssrc(ssrc)
++                        if user_id:
++                            completed.append((user_id, bytes(buf)))
++                        self._buffers[ssrc] = bytearray()
++                        self._released_at.pop(ssrc, None)
++                    elif silence_duration >= self.PTT_STALE_SECONDS:
++                        # Ghost buffer: press whose SPEAKING=0 was never seen.
++                        self._buffers.pop(ssrc, None)
++                        self._speaking_active.pop(ssrc, None)
++                        self._released_at.pop(ssrc, None)
++                        self._last_packet_time.pop(ssrc, None)
++                    continue
+                 if silence_duration >= self.SILENCE_THRESHOLD and buf_duration >= self.MIN_SPEECH_DURATION:
+                     user_id = ssrc_user_map.get(ssrc, 0)
+                     if not user_id:
+@@ -894,7 +959,10 @@ class VoiceReceiver:
+             for ssrc, buf in list(self._buffers.items()):
+                 # 48kHz, 16-bit, stereo = 192000 bytes/sec
+                 buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
+-                if buf_duration >= self.MIN_SPEECH_DURATION:
++                min_duration = 0.0 if self._ptt_mode else self.MIN_SPEECH_DURATION
++                # PTT: an intentional press is speech by definition — honor even
++                # very short presses (a whispered word may be <0.5s of audio).
++                if buf_duration >= max(min_duration, 0.0):
+                     user_id = ssrc_user_map.get(ssrc, 0)
+                     if not user_id:
+                         user_id = self._infer_user_for_ssrc(ssrc)
+@@ -902,6 +970,8 @@ class VoiceReceiver:
+                         completed.append((user_id, bytes(buf)))
+                 self._buffers.pop(ssrc, None)
+                 self._last_packet_time.pop(ssrc, None)
++                self._speaking_active.pop(ssrc, None)
++                self._released_at.pop(ssrc, None)
+         return completed
+ 
+     # --- PCM -> WAV conversion (for Whisper STT) ---
+@@ -3381,7 +3451,15 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+             if source is not None:
+                 self._voice_sources[guild_id] = source
+             try:
+-                receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
++                receiver = VoiceReceiver(
++                    vc, allowed_user_ids=self._allowed_user_ids,
++                    silence_threshold=self._config_value(
++                        "voice_silence_duration", None, env_key="HERMES_DISCORD_VOICE_SILENCE_DURATION"),
++                    min_speech_duration=self._config_value(
++                        "voice_min_speech_duration", None,
++                        env_key="HERMES_DISCORD_VOICE_MIN_SPEECH_DURATION"),
++                    ptt_mode=bool(self._config_value("voice_ptt_mode", False)),
++                )
+                 receiver.start()
+                 self._voice_receivers[guild_id] = receiver
+                 self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
