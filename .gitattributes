@@ -1,0 +1,9 @@
+# Patch files must stay LF on disk.
+#
+# `git apply` matches an LF working tree. With core.autocrlf=true (set on the
+# Windows box this repo is developed on) git checked these .patch files out
+# with CRLF, so `git apply --check` failed on EVERY file after `hermes update`
+# even though the committed blobs and the working-tree base were unchanged.
+# That looks exactly like upstream drift and sends you hand-porting hunks that
+# never needed porting. No EOL conversion for patch payloads.
+*.patch text eol=lf
