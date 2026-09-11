@@ -41,6 +41,27 @@ git apply --check patches/core-combined-v2-postsplit.patch
 git apply patches/core-combined-v2-postsplit.patch
 ```
 
-If `--check` fails: upstream moved the code again — grep for the new homes and
-hand-port (do NOT 3-way apply blindly; file splits produce cross-file conflict
+If `--check` fails **on every file in the patch** but the header `index <old>..<new>`
+hashes still match `git rev-parse HEAD:<path>`, it is line endings, not upstream drift —
+`file <patch>` will show CRLF. `git apply` only matches an LF working tree; normalise and
+re-check before hand-porting anything. (`.gitattributes` pins `*.patch` to LF so this
+should not recur here.)
+
+If `--check` fails on some files with a viable base, upstream moved the code: grep for the
+new homes and hand-port (do NOT 3-way apply blindly; file splits produce cross-file conflict
 blocks). Details in `patches/README-v2.md`.
+
+## Verify a reapply
+
+Both scripts are device-free (nothing plays aloud) and exit non-zero on failure:
+
+```bash
+HA=~/.hermes/hermes-agent   # Windows: %LOCALAPPDATA%/hermes/hermes-agent
+$HA/venv/Scripts/python tests/check_streamer_resolution.py   # real plugin resolves via the real dispatcher
+$HA/venv/Scripts/python tests/e2e_incremental_pipeline.py    # open→feeds→flush→close, audio drained, done-event
+$HA/venv/Scripts/python tests/ptt_real_class_tests.py        # Discord VoiceReceiver PTT semantics, T1–T5
+```
+
+Plus `scripts/run_tests.sh tests/tools/test_tts_streaming.py` in the hermes-agent checkout
+(28/29 — `test_hybrid_prefetch_fires_http_immediately` is a known Windows zero-delta clock
+flake, unrelated to the incremental path).
