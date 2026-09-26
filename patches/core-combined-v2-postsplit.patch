@@ -1,8 +1,8 @@
 diff --git a/apps/desktop/src/app/settings/helpers.ts b/apps/desktop/src/app/settings/helpers.ts
-index b51162f854..6b5b6171d5 100644
+index a8b9b8df7f..0891660ce1 100644
 --- a/apps/desktop/src/app/settings/helpers.ts
 +++ b/apps/desktop/src/app/settings/helpers.ts
-@@ -339,6 +339,27 @@ function commandProviderNames(config: HermesConfigRecord, section: 'tts' | 'stt'
+@@ -344,6 +344,27 @@ function commandProviderNames(config: HermesConfigRecord, section: 'tts' | 'stt'
    return [...names]
  }
  
@@ -31,10 +31,10 @@ index b51162f854..6b5b6171d5 100644
  // tts-1-hd support 9 voices; gpt-4o-mini-tts supports those plus ballad,
  // verse, marin, and cedar (13 total). Unknown/future models get the full
 diff --git a/hermes_cli/web_routers/audio.py b/hermes_cli/web_routers/audio.py
-index ec49c90467..8eba48c929 100644
+index 340114d75e..88e32a3d9c 100644
 --- a/hermes_cli/web_routers/audio.py
 +++ b/hermes_cli/web_routers/audio.py
-@@ -371,6 +371,17 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
+@@ -507,6 +507,17 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
      loop = asyncio.get_running_loop()
  
      def _resolve():
@@ -52,9 +52,9 @@ index ec49c90467..8eba48c929 100644
          from tools.tts_streaming import resolve_streaming_provider
          from tools.tts_tool import _get_provider, _load_tts_config, _resolve_max_text_length
          with _config_profile_scope(profile):
-@@ -402,6 +413,76 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
-         from tools.tts_streaming import SentenceChunker
-         from tools.tts_text_normalize import _strip_markdown_for_tts
+@@ -561,6 +572,76 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
+ 
+         chunker = SentenceChunker.from_config(cfg)  # the requesting profile's tts.streaming.min_len
  
 +        # Incremental providers (Deepgram Flux) get deltas forwarded in real
 +        # time — no sentence chopping, no idle wait. The server emits audio
@@ -126,19 +126,17 @@ index ec49c90467..8eba48c929 100644
 +
 +        # One-shot path: sentence-chunk + stream(text) per sentence.
 +        # Used by ElevenLabs / OpenAI / xAI / Gemini.
-         chunker = SentenceChunker()
- 
          # The session stays open for a whole agent turn and no text arrives
+         # during tool execution, so without an idle flush a narration line with
+         # no trailing whitespace ("Let me check.") sits in the chunker until
 diff --git a/tools/tts_streaming.py b/tools/tts_streaming.py
-index 70eab8e62f..149ca8c437 100644
+index 87ee1fe80f..d42fd1de5c 100644
 --- a/tools/tts_streaming.py
 +++ b/tools/tts_streaming.py
-@@ -96,11 +96,29 @@ class SentenceChunker:
- 
- 
- class StreamingTTSProvider(ABC):
--    """Yields raw int16, little-endian, mono PCM chunks at ``sample_rate`` (built-ins: 24 kHz)."""
-+    """Yields raw int16, little-endian, mono PCM chunks at ``sample_rate`` (built-ins: 24 kHz).
+@@ -122,11 +122,28 @@ class StreamingTTSProvider(ABC):
+     update the instance attribute once the endpoint's real format is known (OpenAI-compatible
+     servers advertise it in the response headers), so consumers open their output device or WAV
+     header after pulling the first chunk, never at construction.
 +
 +    Two operating modes (a provider picks ONE):
 +
@@ -152,7 +150,7 @@ index 70eab8e62f..149ca8c437 100644
 +       (``open_session`` / ``close_session``). Lowest-latency shape — audio emits the moment
 +       enough text arrives, with no idle wait or sentence-boundary chopping. Used by Deepgram
 +       Flux.
-+    """
+     """
  
      sample_rate: int = 24000
      channels: int = 1
@@ -164,7 +162,7 @@ index 70eab8e62f..149ca8c437 100644
  
      def __init__(self, tts_config: Dict, section: Dict):
          self.tts_config = tts_config
-@@ -113,7 +131,57 @@ class StreamingTTSProvider(ABC):
+@@ -139,7 +156,57 @@ class StreamingTTSProvider(ABC):
  
      @abstractmethod
      def stream(self, text: str) -> Iterator[bytes]:
@@ -224,10 +222,10 @@ index 70eab8e62f..149ca8c437 100644
  
  _REGISTRY: Dict[str, type[StreamingTTSProvider]] = {}
 diff --git a/tools/tts_tool_speaker.py b/tools/tts_tool_speaker.py
-index 2d05938a7e..a7024bae28 100644
+index 4b3bf77d0b..332f5d8aad 100644
 --- a/tools/tts_tool_speaker.py
 +++ b/tools/tts_tool_speaker.py
-@@ -274,6 +274,70 @@ class _StreamerPlayback:
+@@ -327,6 +327,70 @@ class _StreamerPlayback:
              t.join(timeout=10.0)
          self.close_output_stream()
  
@@ -298,8 +296,8 @@ index 2d05938a7e..a7024bae28 100644
  
  def stream_tts_to_speaker(
      text_queue: queue.Queue, stop_event: threading.Event, tts_done_event: threading.Event,
-@@ -305,6 +369,53 @@ def stream_tts_to_speaker(
-         chunker = SentenceChunker()
+@@ -358,6 +422,53 @@ def stream_tts_to_speaker(
+         chunker = SentenceChunker.from_config(tts_config)
          spoken_sentences: list[str] = []  # skip duplicate/near-duplicate sentences (LLM repetition)
  
 +        # --- Incremental streamer branch (e.g. Deepgram Flux) ---------------
