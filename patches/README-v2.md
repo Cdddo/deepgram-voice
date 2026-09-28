@@ -1,6 +1,32 @@
 # Deepgram Flux streaming — core patches
 
-## v2.1 (post-split layout, post-10k jump) — core-combined-v2-postsplit.patch — CURRENT
+## v2.2 (discord-voice-ptt-silence.patch) — Discord voice RX hardening — CURRENT
+- Regenerated: 2026-09-27, against hermes-agent commit d0288be5b3. First content
+  update to the discord patch (v1 was the 2026-09-08-era PTT + /voicemode +
+  silence-duration work). Trigger: Discord voice captured 0.2s scraps across
+  whole sessions (2026-09-27) after Discord's server-side DAVE E2EE rollout
+  reached the guild. Two root causes, both fixed:
+    1. DAVE session snapshot race — `VoiceReceiver.start()` snapshotted
+       `conn.dave_session`, but discord.py creates/reinits it asynchronously
+       (and can REPLACE the object mid-call). A snapshot taken before the MLS
+       handshake lands is None → DAVE ciphertext decoded as plaintext → every
+       packet dropped. Fix: `_current_dave_session()` reads the LIVE session
+       per packet, guarded by `isinstance(x, davey.DaveSession)` (the guard
+       keeps mock-based tests on the snapshot fallback).
+    2. PTT/open-mic mode mismatch — config said PTT but the Captain talks
+       open-mic; the receiver waited for op-5 releases that never came and the
+       120s ghost-discard shredded the buffers (config fix:
+       discord.voice_ptt_mode=false; code hardening: op-5 release frames are
+       accepted without a prior user_id binding, rate-limited raw op-5 logging).
+  Also: drop-reason counters (`_rx_stats`: ok/decrypt_fail/dave_fail/opus_err,
+  INFO every 500) — decode-outcome only, control/keepalive packets excluded.
+- Verified 2026-09-27: T1–T5 real-class PTT tests PASS; reverse-check CLEAN on
+  the d0288be5b3 working tree; forward-apply CLEAN on vanilla HEAD (temp repo);
+  live call confirmed by the Captain (open-mic, 110KB utterances transcribed).
+- Supersedes the discord hunk inside v2.1's description above (that file needed
+  no porting for the CORE patch; this patch is its own file).
+
+## v2.1 (post-split layout, post-10k jump) — core-combined-v2-postsplit.patch
 - Regenerated: 2026-09-26, against hermes-agent commit d0288be5b3 (main), after the
   2026-09-26 update (31d0a242 → d0288be5, 10,301 commits; 104 touched the five
   patched files). Same file set and hunk intent as v2 (2026-09-08, b2aa855b62);

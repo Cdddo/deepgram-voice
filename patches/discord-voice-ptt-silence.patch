@@ -1,8 +1,8 @@
 diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
-index 32d754f8bd..3d54e779e2 100644
+index faed8108c71..4bb562b0706 100644
 --- a/plugins/platforms/discord/adapter.py
 +++ b/plugins/platforms/discord/adapter.py
-@@ -161,6 +161,9 @@ _NATIVE_SLASH_COMMANDS: tuple = (
+@@ -162,6 +162,9 @@ _NATIVE_SLASH_COMMANDS: tuple = (
      ("btw", "Ask a side question about the current conversation",
       (("question", str, _REQUIRED, "The side question to answer without interrupting", None),),
       "/btw {question}", "Side question dispatched~"),
@@ -12,7 +12,7 @@ index 32d754f8bd..3d54e779e2 100644
  )
  _DISCORD_SELECT_FIELD_LIMIT = 100
  # Discord caps a single select menu at 25 options; a View holds at most 5 rows.
-@@ -644,9 +647,35 @@ class VoiceReceiver:
+@@ -662,9 +665,35 @@ class VoiceReceiver:
      SAMPLE_RATE = 48000        # Discord native rate
      CHANNELS = 2               # Discord sends stereo
  
@@ -49,7 +49,18 @@ index 32d754f8bd..3d54e779e2 100644
          self._running = False
          self._secret_key: Optional[bytes] = None
          self._dave_session = None
-@@ -695,6 +724,21 @@ class VoiceReceiver:
+@@ -679,6 +708,10 @@ class VoiceReceiver:
+         self._paused = False
+         # Debug logging counter (instance-level to avoid cross-instance races)
+         self._packet_debug_count = 0
++        # DIAGNOSTIC 2026-09-27 (uncommitted): drop-reason counters — voice captures
++        # only ~0.2s across a 12-min session; these counters name the loss layer.
++        self._rx_stats = {"ok": 0, "decrypt_fail": 0, "dave_fail": 0, "opus_err": 0}
++        self._op5_log_count = 0
+ 
+     # --- Lifecycle ---
+ 
+@@ -713,6 +746,21 @@ class VoiceReceiver:
      def resume(self):
          self._paused = False
  
@@ -71,34 +82,126 @@ index 32d754f8bd..3d54e779e2 100644
      # --- SSRC -> user_id mapping via SPEAKING opcode hook ---
  
      def map_ssrc(self, ssrc: int, user_id: int):
-@@ -715,6 +759,7 @@ class VoiceReceiver:
+@@ -730,9 +778,18 @@ class VoiceReceiver:
+                 data = msg.get("d", {})
+                 ssrc = data.get("ssrc")
+                 user_id = data.get("user_id")
++                # DIAGNOSTIC 2026-09-27: releases (speaking=false) never reached
++                # on_speaking_event — log raw op-5 (rate-limited) to name whether
++                # Discord drops them or the ssrc/user gate eats them.
++                receiver_self._log_op5(data)
                  if ssrc and user_id:
                      logger.info("SPEAKING event: ssrc=%d -> user=%s", ssrc, user_id)
                      receiver_self.map_ssrc(int(ssrc), int(user_id))
 +                    receiver_self.on_speaking_event(int(ssrc), bool(data.get("speaking")))
++                elif ssrc and "speaking" in data and not data["speaking"]:
++                    # Release frames may omit user_id — resolve via the ssrc map
++                    # filled by the press. Unmapped-SSRC releases stay ignored.
++                    receiver_self.on_speaking_event(int(ssrc), False)
              if original_hook:
                  await original_hook(ws, msg)
          conn.hook = wrapped_hook
-@@ -805,14 +850,14 @@ class VoiceReceiver:
+@@ -746,6 +803,64 @@ class VoiceReceiver:
+ 
+     # --- Packet handler (called from SocketReader thread) ---
+ 
++
++    def _rx_bump(self, reason: str):
++        """Post-mortem instrumentation 2026-09-27: count DECODE outcomes (control/keepalive
++        packets excluded — they dominated the counts and are not audio loss)."""
++        try:
++            self._rx_stats[reason] += 1
++            total = sum(self._rx_stats.values())
++            if total % 500 == 0:
++                logger.info("Voice RX packet stats: %s", self._rx_stats)
++        except Exception:
++            pass
++
++    def _log_op5(self, data: dict):
++        """DIAGNOSTIC 2026-09-27 (uncommitted): rate-limited raw op-5 dump."""
++        try:
++            self._op5_log_count += 1
++            if self._op5_log_count <= 40:
++                logger.info("OP5 raw: %r", data)
++        except Exception:
++            pass
++
++    def flush_user(self, user_id: int) -> list:
++        """Flush ALL buffered audio belonging to ``user_id`` (channel-leave boundary:
++        per the PTT invariant a channel leave ends any open utterance). Returns
++        [(user_id, pcm_bytes), ...] — one entry per SSRC mapped to the user."""
++        completed = []
++        with self._lock:
++            for ssrc, buf in list(self._buffers.items()):
++                if not buf or self._ssrc_to_user.get(ssrc) != user_id:
++                    continue
++                completed.append((user_id, bytes(buf)))
++                self._buffers.pop(ssrc, None)
++                self._last_packet_time.pop(ssrc, None)
++                self._speaking_active.pop(ssrc, None)
++                self._released_at.pop(ssrc, None)
++        if completed:
++            logger.info(
++                "Channel-leave flush: user=%d, %d buffer(s): %s",
++                user_id, len(completed),
++                ", ".join("%.1fs" % (len(p) / (self.SAMPLE_RATE * self.CHANNELS * 2)) for _, p in completed),
++            )
++        return completed
++
++    def _current_dave_session(self):
++        """Live DAVE session lookup (2026-09-27 fix). ``start()`` snapshots
++        ``conn.dave_session``, but discord.py creates/reinits that session
++        asynchronously — a snapshot taken before the MLS handshake finishes is
++        None, and a reinit replaces the object mid-call. Both left this
++        receiver decrypting DAVE ciphertext as plaintext (Opus garbage). Read
++        the live session per packet; fall back to the snapshot only when the
++        live value isn't a real session (mocks in tests)."""
++        import davey  # noqa: E402 — delayed import, only in voice path
++        conn = getattr(self._vc, "_connection", None)
++        live = getattr(conn, "dave_session", None)
++        if isinstance(live, davey.DaveSession):
++            return live
++        return self._dave_session
++
+     def _on_packet(self, data: bytes):
+         if not self._running or self._paused:
+             return
+@@ -799,6 +914,7 @@ class VoiceReceiver:
+             box = nacl.secret.Aead(self._secret_key)
+             decrypted = box.decrypt(encrypted, header, bytes(nonce))
+         except Exception as e:
++            self._rx_bump("decrypt_fail")
+             if self._packet_debug_count <= 10:
+                 logger.warning("NaCl decrypt failed: %s (hdr=%d, enc=%d)", e, header_size, len(encrypted))
+             return
+@@ -823,18 +939,20 @@ class VoiceReceiver:
              if not decrypted:
                  return
          # --- DAVE E2EE decrypt ---
-+        with self._lock:
-+            dave_user_id = self._ssrc_to_user.get(ssrc, 0)
-         if self._dave_session:
+-        if self._dave_session:
 -            with self._lock:
 -                user_id = self._ssrc_to_user.get(ssrc, 0)
 -            if user_id:
++        with self._lock:
++            dave_user_id = self._ssrc_to_user.get(ssrc, 0)
++        live_dave = self._current_dave_session()
++        if live_dave:
 +            if dave_user_id:
                  try:
                      import davey
-                     decrypted = self._dave_session.decrypt(
+-                    decrypted = self._dave_session.decrypt(
 -                        user_id, davey.MediaType.audio, decrypted
++                    decrypted = live_dave.decrypt(
 +                        dave_user_id, davey.MediaType.audio, decrypted
                      )
                  except Exception as e:
                      # Unencrypted passthrough — use NaCl-decrypted data as-is
-@@ -825,9 +870,31 @@ class VoiceReceiver:
+                     if "Unencrypted" not in str(e):
++                        self._rx_bump("dave_fail")
+                         if self._packet_debug_count <= 10:
+                             logger.warning("DAVE decrypt failed for ssrc=%d: %s", ssrc, e)
+                         return
+@@ -843,17 +961,58 @@ class VoiceReceiver:
              if ssrc not in self._decoders:
                  self._decoders[ssrc] = discord.opus.Decoder()
              pcm = self._decoders[ssrc].decode(decrypted)
@@ -129,10 +232,13 @@ index 32d754f8bd..3d54e779e2 100644
 +                            self._speaking_active[ssrc] = True
 +            self._buffers[ssrc].extend(pcm)
 +            self._last_packet_time[ssrc] = time.monotonic()
++            self._rx_bump("ok")
          except Exception as e:
              with self._lock:
                  self._decoders.pop(ssrc, None)
-@@ -836,6 +903,23 @@ class VoiceReceiver:
++            self._rx_bump("opus_err")
+             logger.debug("Opus decode error for SSRC %s; reset decoder: %s", ssrc, e)
+             return
  
      # --- Silence detection ---
  
@@ -156,7 +262,7 @@ index 32d754f8bd..3d54e779e2 100644
      def _infer_user_for_ssrc(self, ssrc: int) -> int:
          """Infer user_id for an unmapped SSRC: after a bot rejoin Discord may not resend
          SPEAKING, so if exactly one allowed user is in the channel, map the SSRC to them."""
-@@ -859,7 +943,11 @@ class VoiceReceiver:
+@@ -877,7 +1036,11 @@ class VoiceReceiver:
          return 0
  
      def check_silence(self) -> list:
@@ -169,7 +275,7 @@ index 32d754f8bd..3d54e779e2 100644
          now = time.monotonic()
          completed = []
          with self._lock:
-@@ -871,6 +959,38 @@ class VoiceReceiver:
+@@ -889,6 +1052,48 @@ class VoiceReceiver:
                  buf = self._buffers[ssrc]
                  # 48kHz, 16-bit, stereo = 192000 bytes/sec
                  buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
@@ -192,6 +298,10 @@ index 32d754f8bd..3d54e779e2 100644
 +                            and now - grace_anchor >= self.PTT_TAIL_GRACE):
 +                        user_id = ssrc_user_map.get(ssrc, 0) or self._infer_user_for_ssrc(ssrc)
 +                        if user_id:
++                            logger.info(
++                                "PTT flush: ssrc=%d user=%d bytes=%d (%.1fs)",
++                                ssrc, user_id, len(buf),
++                                len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2))
 +                            completed.append((user_id, bytes(buf)))
 +                        self._buffers[ssrc] = bytearray()
 +                        self._released_at.pop(ssrc, None)
@@ -200,6 +310,12 @@ index 32d754f8bd..3d54e779e2 100644
 +                        # Ghost buffer: SSRC whose release event was never seen
 +                        # (e.g. both op-5 events lost in the join race). Leak
 +                        # prevention only — PCM accumulates ~11MB/min/SSRC.
++                        logger.info(
++                            "PTT ghost-discard: ssrc=%d bytes=%d (%.1fs audio DROPPED; "
++                            "no release event seen — releases lost? user=%s)",
++                            ssrc, len(buf),
++                            len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2),
++                            ssrc_user_map.get(ssrc, "?"))
 +                        self._buffers.pop(ssrc, None)
 +                        self._speaking_active.pop(ssrc, None)
 +                        self._released_at.pop(ssrc, None)
@@ -208,7 +324,7 @@ index 32d754f8bd..3d54e779e2 100644
                  if silence_duration >= self.SILENCE_THRESHOLD and buf_duration >= self.MIN_SPEECH_DURATION:
                      user_id = ssrc_user_map.get(ssrc, 0)
                      if not user_id:
-@@ -894,7 +1014,10 @@ class VoiceReceiver:
+@@ -912,7 +1117,10 @@ class VoiceReceiver:
              for ssrc, buf in list(self._buffers.items()):
                  # 48kHz, 16-bit, stereo = 192000 bytes/sec
                  buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
@@ -220,7 +336,7 @@ index 32d754f8bd..3d54e779e2 100644
                      user_id = ssrc_user_map.get(ssrc, 0)
                      if not user_id:
                          user_id = self._infer_user_for_ssrc(ssrc)
-@@ -902,6 +1025,8 @@ class VoiceReceiver:
+@@ -920,6 +1128,8 @@ class VoiceReceiver:
                          completed.append((user_id, bytes(buf)))
                  self._buffers.pop(ssrc, None)
                  self._last_packet_time.pop(ssrc, None)
@@ -229,7 +345,7 @@ index 32d754f8bd..3d54e779e2 100644
          return completed
  
      # --- PCM -> WAV conversion (for Whisper STT) ---
-@@ -3381,7 +3506,15 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+@@ -3570,7 +3780,15 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
              if source is not None:
                  self._voice_sources[guild_id] = source
              try:
@@ -246,7 +362,7 @@ index 32d754f8bd..3d54e779e2 100644
                  receiver.start()
                  self._voice_receivers[guild_id] = receiver
                  self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
-@@ -3659,9 +3792,23 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+@@ -3848,9 +4066,23 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
              from tools.transcription_tools import transcribe_audio
              result = await asyncio.to_thread(transcribe_audio, wav_path)
              if not result.get("success"):
@@ -271,7 +387,7 @@ index 32d754f8bd..3d54e779e2 100644
                  return
              logger.info("Voice input from user %d: %s", user_id, transcript[:100])
              if self._voice_input_callback:
-@@ -4173,6 +4320,114 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+@@ -4413,6 +4645,114 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                  _handler = discord.app_commands.choices(**choices)(_handler)
          return _handler
  
@@ -386,7 +502,7 @@ index 32d754f8bd..3d54e779e2 100644
      def _register_thread_slash(self, tree, name: str, description: str) -> None:
          @tree.command(name=name, description=description)
          @discord.app_commands.describe(
-@@ -4246,6 +4501,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+@@ -4486,6 +4826,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
          except Exception as e:
              logger.warning("Discord auto-register from plugin commands failed: %s", e)
          self._register_skill_group(tree)
