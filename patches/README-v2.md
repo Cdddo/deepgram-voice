@@ -53,13 +53,33 @@
 - Contents: incremental protocol on StreamingTTSProvider (supports_streaming,
   open_session/feed/iter_audio/close_session) + incremental drain path in
   _StreamerPlayback + incremental branches in stream_tts_to_speaker and
-  speak_stream_ws (+ forced plugin discovery in _resolve) + inert helpers.ts stub.
+  speak_stream_ws (+ forced plugin discovery in _resolve).
+- 2026-10-27: `apps/desktop/src/app/settings/helpers.ts` DROPPED from this patch.
+  Its only hunk was an inert `_pluginProviderNames()` stub (returns `[]`, no
+  callers anywhere in the desktop source) documenting why plugin-registered
+  TTS/STT providers cannot reach the settings dropdown. Upstream has since
+  shipped the Reasoning Blocks settings fix (`configFieldValue` / `setConfigField`
+  / `localShowReasoning` are all in the clean tree), so the stub was dead weight.
+  The patch is now THREE files, and the patched-file inventory is FIVE.
+
+## Update target: a stable RELEASE, not the tip
+
+`hermes update` lands the latest published stable release, which is cut from a
+commit thousands behind `origin/main`. Always judge and port patches against the
+release commit, never the tip — `scripts/preflight.py` resolves it via
+`hermes_cli.source_releases.resolve_source_release("stable", pointer=False)` and
+prints it. A forward-port built against the tip will fail against the release
+while the canonical patch still applies; `patches/preview/` holds such ports,
+which must never be applied to a release tree.
 
 ## Restore after hermes update
     cd ~/.hermes/hermes-agent   # Windows: %LOCALAPPDATA%/hermes/hermes-agent
+    python "E:/Projects/Hermes Plugins/deepgram-voice/scripts/preflight.py" --deep
     git apply --check patches/core-combined-v2-postsplit.patch   # from this dir
     git apply patches/core-combined-v2-postsplit.patch
-If --check fails: upstream moved the code again. Do NOT 3-way apply blindly (file
+Test BOTH the canonical and any forward-port against the landed tree and apply
+whichever passes — the canonical usually wins after a release. If neither
+--check passes: upstream moved the code again. Do NOT 3-way apply blindly (file
 splits produce cross-file conflict blocks). Locate the new homes:
     grep -rn "def speak_stream_ws\|def stream_tts_to_speaker\|class StreamingTTSProvider" hermes_cli/ tools/
 …then hand-port. Verify: py_compile the touched files, then run the E2E checks

@@ -1,40 +1,8 @@
-diff --git a/apps/desktop/src/app/settings/helpers.ts b/apps/desktop/src/app/settings/helpers.ts
-index a8b9b8df7f..0891660ce1 100644
---- a/apps/desktop/src/app/settings/helpers.ts
-+++ b/apps/desktop/src/app/settings/helpers.ts
-@@ -344,6 +344,27 @@ function commandProviderNames(config: HermesConfigRecord, section: 'tts' | 'stt'
-   return [...names]
- }
- 
-+// Plugin-registered TTS/STT provider names from
-+// `~/.hermes/plugins/tts/<name>/` and `~/.hermes/plugins/transcription/<name>/`.
-+//
-+// NOTE: intentionally NOT wired into the desktop settings dropdown.
-+// The desktop renderer runs in a sandboxed Electron context with no
-+// `nodeIntegration` and no access to the Python `agent.*_registry`
-+// modules. Calling `list_providers()` from the renderer is not
-+// possible without a deliberate IPC capability (see
-+// `apps/desktop/AGENTS.md` — "renderer never reaches for Node").
-+// Plugin-registered providers therefore surface only in the CLI
-+// picker (`hermes_cli.tools_config._plugin_tts_providers`), which
-+// runs in the gateway and has full Python access. The desktop
-+// dropdown instead reads `tts.providers.*` / `stt.providers.*`
-+// command-type blocks via `commandProviderNames()` (the same path
-+// the Fish TTS provider uses). User-installed providers that want
-+// to appear in the desktop dropdown should declare a command block
-+// in `config.yaml`, not register via the plugin API.
-+function _pluginProviderNames(_section: 'tts' | 'stt'): string[] {
-+  return []
-+}
-+
- // Voice sets per OpenAI speech model, per the OpenAI TTS API docs: tts-1 and
- // tts-1-hd support 9 voices; gpt-4o-mini-tts supports those plus ballad,
- // verse, marin, and cedar (13 total). Unknown/future models get the full
 diff --git a/hermes_cli/web_routers/audio.py b/hermes_cli/web_routers/audio.py
-index 340114d75e..88e32a3d9c 100644
+index c4300d7f93..1a619336d1 100644
 --- a/hermes_cli/web_routers/audio.py
 +++ b/hermes_cli/web_routers/audio.py
-@@ -507,6 +507,17 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
+@@ -627,6 +627,17 @@ async def speak_stream_ws(ws: WebSocket) -> None:
      loop = asyncio.get_running_loop()
  
      def _resolve():
@@ -52,7 +20,7 @@ index 340114d75e..88e32a3d9c 100644
          from tools.tts_streaming import resolve_streaming_provider
          from tools.tts_tool import _get_provider, _load_tts_config, _resolve_max_text_length
          with _config_profile_scope(profile):
-@@ -561,6 +572,76 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
+@@ -681,6 +692,76 @@ async def speak_stream_ws(ws: WebSocket) -> None:
  
          chunker = SentenceChunker.from_config(cfg)  # the requesting profile's tts.streaming.min_len
  
@@ -130,28 +98,10 @@ index 340114d75e..88e32a3d9c 100644
          # during tool execution, so without an idle flush a narration line with
          # no trailing whitespace ("Let me check.") sits in the chunker until
 diff --git a/tools/tts_streaming.py b/tools/tts_streaming.py
-index 87ee1fe80f..d42fd1de5c 100644
+index af9ccf7b84..eb63a61f89 100644
 --- a/tools/tts_streaming.py
 +++ b/tools/tts_streaming.py
-@@ -122,11 +122,28 @@ class StreamingTTSProvider(ABC):
-     update the instance attribute once the endpoint's real format is known (OpenAI-compatible
-     servers advertise it in the response headers), so consumers open their output device or WAV
-     header after pulling the first chunk, never at construction.
-+
-+    Two operating modes (a provider picks ONE):
-+
-+    1. **One-shot** (the default — backwards-compatible): the dispatcher buffers a chunk of
-+       text and calls ``stream(text)`` once. The provider yields PCM chunks for that text and
-+       returns. Used by ElevenLabs, OpenAI, xAI, Gemini.
-+
-+    2. **Incremental** (``supports_streaming = True``): the dispatcher keeps the provider
-+       session open for the whole reply, calling ``feed(delta)`` as LLM tokens arrive and
-+       ``iter_audio()`` to drain PCM. The provider manages its own connection lifecycle
-+       (``open_session`` / ``close_session``). Lowest-latency shape — audio emits the moment
-+       enough text arrives, with no idle wait or sentence-boundary chopping. Used by Deepgram
-+       Flux.
-     """
- 
+@@ -129,6 +129,10 @@ class StreamingTTSProvider(ABC):
      sample_rate: int = 24000
      channels: int = 1
      sample_width: int = 2  # bytes/sample (int16)
@@ -160,9 +110,9 @@ index 87ee1fe80f..d42fd1de5c 100644
 +    # stream() per sentence chunk.
 +    supports_streaming: bool = False
  
-     def __init__(self, tts_config: Dict, section: Dict):
+     def __init__(self, tts_config: dict, section: dict):
          self.tts_config = tts_config
-@@ -139,7 +156,57 @@ class StreamingTTSProvider(ABC):
+@@ -141,7 +145,57 @@ class StreamingTTSProvider(ABC):
  
      @abstractmethod
      def stream(self, text: str) -> Iterator[bytes]:
@@ -220,9 +170,87 @@ index 87ee1fe80f..d42fd1de5c 100644
 +        )
  
  
- _REGISTRY: Dict[str, type[StreamingTTSProvider]] = {}
+ _REGISTRY: dict[str, type[StreamingTTSProvider]] = {}
+@@ -333,23 +387,51 @@ class GeminiStreamer(StreamingTTSProvider):
+         import json as _json
+         import requests
+         from tools.tts_tool_providers import (
+-            DEFAULT_GEMINI_TTS_BASE_URL, DEFAULT_GEMINI_TTS_MODEL, DEFAULT_GEMINI_TTS_VOICE)
++            DEFAULT_GEMINI_TTS_BASE_URL, DEFAULT_GEMINI_TTS_MODEL, DEFAULT_GEMINI_TTS_VOICE,
++            _compose_gemini_tts_prompt, _gemini_tts_candidate_keys,
++            _gemini_tts_uses_speech_metadata, _read_gemini_persona_prompt)
+         from hermes_cli.config import get_env_value
+-        api_key = _gemini_key()
+         model = str(self.section.get("model", DEFAULT_GEMINI_TTS_MODEL)).strip() or DEFAULT_GEMINI_TTS_MODEL
+         voice = str(self.section.get("voice", DEFAULT_GEMINI_TTS_VOICE)).strip() or DEFAULT_GEMINI_TTS_VOICE
+         from agent.gemini_native_adapter import normalize_gemini_base_url
+         base_url = normalize_gemini_base_url(
+             self.section.get("base_url") or get_env_value("GEMINI_BASE_URL") or DEFAULT_GEMINI_TTS_BASE_URL,
+         )
++        persona_prompt = _read_gemini_persona_prompt(self.section)
++        # Same model-gated styling as the non-streaming provider: 3.8 TTS takes a
++        # verbatim transcript plus speech_metadata.style; the 2.5 preview models take
++        # the inline direction form. Without this the streamer sends bare text and
++        # gets none of the configured persona at all.
++        prompt_text = text
++        if not _gemini_tts_uses_speech_metadata(model):
++            prompt_text = _compose_gemini_tts_prompt(text, self.section)
+         payload = {
+-            "contents": [{"parts": [{"text": text}]}],
++            "contents": [{"parts": [{"text": prompt_text}]}],
+             "generationConfig": {
+                 "responseModalities": ["AUDIO"],
+                 "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}}}}
++        if _gemini_tts_uses_speech_metadata(model) and (persona_prompt or "").strip():
++            payload["contents"][0]["parts"][0]["speech_metadata"] = {"style": persona_prompt.strip()}
+         url = f"{base_url}/models/{model}:streamGenerateContent"
+ 
+-        def _sse_chunks() -> Iterator[bytes]:
++        # Same per-call key rotation as the non-streaming provider: resolve every
++        # candidate (resolver first, then pool), skip keys in in-process cooldown,
++        # and on a 429 bench the failed key (parsed retry hint) and move to the
++        # next. The cooldown map is SHARED with tools.tts_tool_providers so a key
++        # rate-limited by either path is skipped by both. Rotation only happens
++        # before the first audio byte (raise_for_status runs pre-body), so a
++        # retry can never duplicate already-yielded audio.
++        import time as _time
++        from tools.tts_tool_providers import (
++            _GEMINI_TTS_KEY_COOLDOWN, _gemini_rate_limit_cooldown)
++        keys = _gemini_tts_candidate_keys()
++        if not keys:
++            raise RuntimeError("Gemini TTS streaming: no API key available")
++        now = _time.time()
++        cooled = [k for k in keys if _GEMINI_TTS_KEY_COOLDOWN.get(k, 0.0) <= now]
++        attempt_keys = cooled or keys
++
++        def _sse_chunks(api_key: str) -> Iterator[bytes]:
+             with requests.post(
+                 url, params={"alt": "sse"}, headers={"x-goog-api-key": api_key},
+                 json=payload, timeout=60, stream=True,
+@@ -371,7 +453,20 @@ class GeminiStreamer(StreamingTTSProvider):
+                         except (ValueError, TypeError) as exc:
+                             logger.warning("Gemini SSE: bad base64 audio: %s", exc)
+ 
+-        yield from _capped(_sse_chunks(), "Gemini streaming TTS")
++        for idx, api_key in enumerate(attempt_keys):
++            try:
++                yield from _capped(_sse_chunks(api_key), "Gemini streaming TTS")
++                return
++            except requests.HTTPError as exc:
++                status = getattr(exc.response, "status_code", None)
++                if status == 429 and idx < len(attempt_keys) - 1:
++                    detail = (getattr(exc.response, "text", "") or "")[:300]
++                    _GEMINI_TTS_KEY_COOLDOWN[api_key] = _time.time() + _gemini_rate_limit_cooldown(detail)
++                    logger.warning(
++                        "Gemini TTS streaming: HTTP 429 on credential #%d; rotating to the next "
++                        "pool credential (%s)", idx + 1, detail)
++                    continue
++                raise
+ 
+ 
+ # Bounded like SpeakerPipeline's _CHUNK_QUEUE_MAX: the pump waits for the consumer instead of
 diff --git a/tools/tts_tool_speaker.py b/tools/tts_tool_speaker.py
-index 4b3bf77d0b..332f5d8aad 100644
+index 2c058e5499..5d2826da6e 100644
 --- a/tools/tts_tool_speaker.py
 +++ b/tools/tts_tool_speaker.py
 @@ -327,6 +327,70 @@ class _StreamerPlayback:
