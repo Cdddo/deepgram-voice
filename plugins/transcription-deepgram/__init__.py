@@ -72,7 +72,11 @@ from agent.transcription_provider import TranscriptionProvider
 logger = logging.getLogger(__name__)
 
 DEEPGRAM_WS_URL = "wss://api.deepgram.com/v2/listen"
+DEEPGRAM_REST_URL = "https://api.deepgram.com/v1/listen"
 DEFAULT_MODEL = "flux-general-multi"
+# Pre-recorded REST model for container files (ogg/mp3/...). Flux has no
+# pre-recorded path, so non-PCM inputs go to nova-3 instead.
+DEFAULT_PRE_RECORDED_MODEL = "nova-3"
 # ~80ms of 16 kHz mono s16le = 16000 * 0.08 * 2 = 2560 bytes
 _CHUNK_BYTES = 2560
 _CONNECT_TIMEOUT = 15.0
@@ -314,6 +318,41 @@ async def _transcribe_ws(
     return " ".join(out).strip()
 
 
+async def _transcribe_rest(
+    *,
+    api_key: str,
+    audio: bytes,
+    model: str,
+    language: Optional[str] = None,
+) -> str:
+    """Pre-recorded transcription of a container file (ogg/mp3/flac/m4a/...).
+
+    Deepgram's REST ``/v1/listen`` accepts finished files directly — no
+    container/PCM gymnastics needed. Used for non-raw-PCM inputs where the
+    Flux WS path (streaming-only) fails or is wasteful.
+    """
+    import httpx
+
+    params: Dict[str, Any] = {"model": model, "smart_format": "true", "punctuate": "true"}
+    if language:
+        params["language"] = language
+    url = f"{DEEPGRAM_REST_URL}?{urlencode(params)}"
+    resp = await httpx.AsyncClient(timeout=60.0).post(
+        url,
+        headers={"Authorization": f"Token {api_key}", "Content-Type": "application/octet-stream"},
+        content=audio,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Deepgram REST /v1/listen returned HTTP {resp.status_code}: {resp.text[:300]}"
+        )
+    data = resp.json()
+    try:
+        return (data["results"]["channels"][0]["alternatives"][0].get("transcript") or "").strip()
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+
 class DeepgramSTTProvider(TranscriptionProvider):
     """Deepgram Flux STT via ``wss://api.deepgram.com/v2/listen``."""
 
@@ -421,6 +460,17 @@ class DeepgramSTTProvider(TranscriptionProvider):
         lang = language or (
             cfg.get("language") if isinstance(cfg.get("language"), str) else None
         )
+        # Suppress the core's seeded global default (``stt.language: "en"`` in
+        # config_defaults.py, added for local-Whisper auto-detect). Applied to every
+        # provider, it makes nova-3 REST drop non-English audio. Only honor "en"
+        # when set EXPLICITLY per-provider (stt.deepgram.language); otherwise fall
+        # through to the model-native default (multi).
+        if (
+            lang == "en"
+            and language == "en"
+            and not (isinstance(cfg.get("language"), str) and cfg.get("language").strip())
+        ):
+            lang = None
         if lang and chosen_model == "flux-general-multi":
             hints = [lang]
         cfg_hints = cfg.get("language_hint")
@@ -448,33 +498,88 @@ class DeepgramSTTProvider(TranscriptionProvider):
             }
 
         logger.info(
-            "Transcribing %s with Deepgram Flux (%s, %d bytes, raw_pcm=%s)...",
+            "Transcribing %s with Deepgram (%s, %d bytes, raw_pcm=%s)...",
             path.name,
             chosen_model,
             len(audio),
             is_raw,
         )
 
-        try:
-            transcript = _run_coro(
-                _transcribe_ws(
-                    api_key=api_key,
-                    audio=audio,
-                    model=chosen_model,
-                    sample_rate=sample_rate,
-                    encoding=encoding,
-                    is_raw_pcm=is_raw,
-                    language_hint=hints,
+        # Route: raw PCM (live Discord receiver path) → Flux WS streaming.
+        # Container files (Telegram voice/audio attachments, uploads) → the
+        # pre-recorded REST API — Flux is streaming-only and fails on files.
+        #
+        # Option B (stt.deepgram.discord_mode: batch): the Discord receiver's
+        # raw-PCM utterance goes through the proven pre-recorded REST API
+        # (nova-3, language=multi) instead of the per-utterance Flux WS —
+        # the traditional batch pipeline every other provider uses. The WAV
+        # container is posted directly; REST handles it natively. Costs
+        # +1–2 s perceived latency per utterance; accepted tradeoff while
+        # the Flux per-utterance bugs make calls unusable. Flux stays the
+        # default (discord_mode: flux).
+        use_batch = (
+            is_raw
+            and str(cfg.get("discord_mode") or "").strip().lower() == "batch"
+        )
+        if is_raw and not use_batch:
+            try:
+                transcript = _run_coro(
+                    _transcribe_ws(
+                        api_key=api_key,
+                        audio=audio,
+                        model=chosen_model,
+                        sample_rate=sample_rate,
+                        encoding=encoding,
+                        is_raw_pcm=is_raw,
+                        language_hint=hints,
+                    )
                 )
+            except Exception as exc:  # noqa: BLE001 — convert to envelope
+                logger.warning("Deepgram Flux STT failed: %s", exc, exc_info=True)
+                return {
+                    "success": False,
+                    "transcript": "",
+                    "error": f"Deepgram Flux STT failed: {exc}",
+                    "provider": self.name,
+                }
+        else:
+            rest_model = (
+                cfg.get("pre_recorded_model")
+                if isinstance(cfg.get("pre_recorded_model"), str)
+                else None
+            ) or DEFAULT_PRE_RECORDED_MODEL
+            # Deepgram defaults to language=en when the parameter is absent;
+            # nova-3's `multi` gives automatic ES/EN (+8 more) code-switching,
+            # which is the right default for bilingual voice notes.
+            rest_lang = lang or "multi"
+            # Batch mode (discord_mode: batch) follows the same shape as every
+            # other REST provider: the ORIGINAL container file goes up as-is
+            # (WAV from the Discord receiver, ogg from Telegram, ...). Posting
+            # the decoded bare PCM would arrive without framing.
+            rest_audio = path.read_bytes() if use_batch else audio
+            logger.info(
+                "Container file detected — using pre-recorded REST API (model %s, language %s%s)",
+                rest_model,
+                rest_lang,
+                ", discord batch mode" if use_batch else "",
             )
-        except Exception as exc:  # noqa: BLE001 — convert to envelope
-            logger.warning("Deepgram Flux STT failed: %s", exc, exc_info=True)
-            return {
-                "success": False,
-                "transcript": "",
-                "error": f"Deepgram Flux STT failed: {exc}",
-                "provider": self.name,
-            }
+            try:
+                transcript = _run_coro(
+                    _transcribe_rest(
+                        api_key=api_key,
+                        audio=rest_audio,
+                        model=rest_model,
+                        language=rest_lang,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 — convert to envelope
+                logger.warning("Deepgram REST STT failed: %s", exc, exc_info=True)
+                return {
+                    "success": False,
+                    "transcript": "",
+                    "error": f"Deepgram REST STT failed: {exc}",
+                    "provider": self.name,
+                }
 
         if not transcript:
             return {
