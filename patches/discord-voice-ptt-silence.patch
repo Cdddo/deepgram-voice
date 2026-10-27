@@ -1,23 +1,25 @@
 diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
-index faed8108c71..4bb562b0706 100644
+index 15213f5785..0ec03ea02b 100644
 --- a/plugins/platforms/discord/adapter.py
 +++ b/plugins/platforms/discord/adapter.py
-@@ -162,6 +162,9 @@ _NATIVE_SLASH_COMMANDS: tuple = (
-     ("btw", "Ask a side question about the current conversation",
-      (("question", str, _REQUIRED, "The side question to answer without interrupting", None),),
-      "/btw {question}", "Side question dispatched~"),
+@@ -167,6 +167,11 @@ _NATIVE_SLASH_COMMAND_SPECS: tuple = (
+     ("btw", "platform.discord.command.btw.description",
+      (("question", str, _REQUIRED, "platform.discord.command.btw.arg_question", None),),
+      "/btw {question}", "platform.discord.command.btw.followup"),
 +    # /voicemode: template None -> registered by _register_voicemode_slash (custom handler:
 +    # toggles voice input mode live, persisted to discord.voice_ptt_mode).
++    # Literal description (no ".") passes through _text() untranslated; i18n key
++    # conversion is a follow-up once the patch re-bases on the language-pack system.
 +    ("voicemode", "Show or toggle voice input mode (push-to-talk vs open mic)", (), None, None),
  )
- _DISCORD_SELECT_FIELD_LIMIT = 100
- # Discord caps a single select menu at 25 options; a View holds at most 5 rows.
-@@ -662,9 +665,35 @@ class VoiceReceiver:
-     SAMPLE_RATE = 48000        # Discord native rate
+ # Discord rejects the whole bulk sync (error 50035) when ONE description / parameter description /
+ # Choice name exceeds 100 UTF-16 units, so every localized slot is cut at the cap.
+@@ -710,9 +715,35 @@ class VoiceReceiver:
      CHANNELS = 2               # Discord sends stereo
+     REKEY_FAILURE_STREAK = 25  # consecutive NaCl failures → re-resolve creds
  
--    def __init__(self, voice_client, allowed_user_ids: set = None):
-+    def __init__(self, voice_client, allowed_user_ids: set = None,
+-    def __init__(self, voice_client, allowed_user_ids: set | None = None):
++    def __init__(self, voice_client, allowed_user_ids: set | None = None,
 +                 silence_threshold: float = None, min_speech_duration: float = None,
 +                 ptt_mode: bool = False):
          self._vc = voice_client
@@ -47,9 +49,9 @@ index faed8108c71..4bb562b0706 100644
 +        self._speaking_active: Dict[int, bool] = {}
 +        self._released_at: Dict[int, float] = {}
          self._running = False
-         self._secret_key: Optional[bytes] = None
-         self._dave_session = None
-@@ -679,6 +708,10 @@ class VoiceReceiver:
+ 
+         # Decryption state, kept as ONE tuple (secret_key, dave_session,
+@@ -739,6 +770,10 @@ class VoiceReceiver:
          self._paused = False
          # Debug logging counter (instance-level to avoid cross-instance races)
          self._packet_debug_count = 0
@@ -58,9 +60,9 @@ index faed8108c71..4bb562b0706 100644
 +        self._rx_stats = {"ok": 0, "decrypt_fail": 0, "dave_fail": 0, "opus_err": 0}
 +        self._op5_log_count = 0
  
-     # --- Lifecycle ---
- 
-@@ -713,6 +746,21 @@ class VoiceReceiver:
+         # Decode-health counters (logged at teardown) and the NaCl failure
+         # streak used to detect stale credentials after a re-key.
+@@ -871,6 +906,21 @@ class VoiceReceiver:
      def resume(self):
          self._paused = False
  
@@ -82,7 +84,7 @@ index faed8108c71..4bb562b0706 100644
      # --- SSRC -> user_id mapping via SPEAKING opcode hook ---
  
      def map_ssrc(self, ssrc: int, user_id: int):
-@@ -730,9 +778,18 @@ class VoiceReceiver:
+@@ -888,9 +938,18 @@ class VoiceReceiver:
                  data = msg.get("d", {})
                  ssrc = data.get("ssrc")
                  user_id = data.get("user_id")
@@ -100,8 +102,8 @@ index faed8108c71..4bb562b0706 100644
 +                    receiver_self.on_speaking_event(int(ssrc), False)
              if original_hook:
                  await original_hook(ws, msg)
-         conn.hook = wrapped_hook
-@@ -746,6 +803,64 @@ class VoiceReceiver:
+             # Re-resolve decryption state after the events that change it.
+@@ -945,6 +1004,64 @@ class VoiceReceiver:
  
      # --- Packet handler (called from SocketReader thread) ---
  
@@ -166,30 +168,40 @@ index faed8108c71..4bb562b0706 100644
      def _on_packet(self, data: bytes):
          if not self._running or self._paused:
              return
-@@ -799,6 +914,7 @@ class VoiceReceiver:
-             box = nacl.secret.Aead(self._secret_key)
+@@ -1005,6 +1122,7 @@ class VoiceReceiver:
              decrypted = box.decrypt(encrypted, header, bytes(nonce))
+             self._nacl_fail_streak = 0
          except Exception as e:
 +            self._rx_bump("decrypt_fail")
-             if self._packet_debug_count <= 10:
-                 logger.warning("NaCl decrypt failed: %s (hdr=%d, enc=%d)", e, header_size, len(encrypted))
-             return
-@@ -823,18 +939,20 @@ class VoiceReceiver:
+             self._decode_failed += 1
+             self._nacl_fail_streak += 1
+             # Never go fully dark: after the first 10 warnings, keep emitting
+@@ -1043,23 +1161,28 @@ class VoiceReceiver:
              if not decrypted:
                  return
          # --- DAVE E2EE decrypt ---
--        if self._dave_session:
--            with self._lock:
--                user_id = self._ssrc_to_user.get(ssrc, 0)
--            if user_id:
-+        with self._lock:
-+            dave_user_id = self._ssrc_to_user.get(ssrc, 0)
+-        if dave_session:
 +        live_dave = self._current_dave_session()
 +        if live_dave:
+             with self._lock:
+-                user_id = self._ssrc_to_user.get(ssrc, 0)
+-                if not user_id:
++                dave_user_id = self._ssrc_to_user.get(ssrc, 0)
++                if not dave_user_id:
+                     # Rejoin race: SPEAKING may never be resent for a user who
+                     # was already talking — try the sole-member inference
+-                    # before giving up on this frame.
+-                    user_id = self._infer_user_for_ssrc(ssrc)
+-            if user_id:
++                    # before giving up on this frame. Runs ONLY under a live
++                    # DAVE session: when no session is active the SSRC must
++                    # stay unmapped here so the eager-binding block below owns
++                    # the first bind (and its PTT key-held synthesis).
++                    dave_user_id = self._infer_user_for_ssrc(ssrc)
 +            if dave_user_id:
                  try:
                      import davey
--                    decrypted = self._dave_session.decrypt(
+-                    decrypted = dave_session.decrypt(
 -                        user_id, davey.MediaType.audio, decrypted
 +                    decrypted = live_dave.decrypt(
 +                        dave_user_id, davey.MediaType.audio, decrypted
@@ -201,10 +213,10 @@ index faed8108c71..4bb562b0706 100644
                          if self._packet_debug_count <= 10:
                              logger.warning("DAVE decrypt failed for ssrc=%d: %s", ssrc, e)
                          return
-@@ -843,17 +961,58 @@ class VoiceReceiver:
-             if ssrc not in self._decoders:
+@@ -1093,17 +1216,58 @@ class VoiceReceiver:
                  self._decoders[ssrc] = discord.opus.Decoder()
              pcm = self._decoders[ssrc].decode(decrypted)
+             self._decode_ok += 1
 +            # Eager SSRC binding (both modes): if this SSRC has no user yet, the
 +            # SPEAKING press event was likely lost (the hook installs after
 +            # channel.connect() returns — op-5 events in that gap never reach
@@ -262,7 +274,7 @@ index faed8108c71..4bb562b0706 100644
      def _infer_user_for_ssrc(self, ssrc: int) -> int:
          """Infer user_id for an unmapped SSRC: after a bot rejoin Discord may not resend
          SPEAKING, so if exactly one allowed user is in the channel, map the SSRC to them."""
-@@ -877,7 +1036,11 @@ class VoiceReceiver:
+@@ -1127,7 +1291,11 @@ class VoiceReceiver:
          return 0
  
      def check_silence(self) -> list:
@@ -275,7 +287,7 @@ index faed8108c71..4bb562b0706 100644
          now = time.monotonic()
          completed = []
          with self._lock:
-@@ -889,6 +1052,48 @@ class VoiceReceiver:
+@@ -1139,6 +1307,48 @@ class VoiceReceiver:
                  buf = self._buffers[ssrc]
                  # 48kHz, 16-bit, stereo = 192000 bytes/sec
                  buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
@@ -324,7 +336,7 @@ index faed8108c71..4bb562b0706 100644
                  if silence_duration >= self.SILENCE_THRESHOLD and buf_duration >= self.MIN_SPEECH_DURATION:
                      user_id = ssrc_user_map.get(ssrc, 0)
                      if not user_id:
-@@ -912,7 +1117,10 @@ class VoiceReceiver:
+@@ -1162,7 +1372,10 @@ class VoiceReceiver:
              for ssrc, buf in list(self._buffers.items()):
                  # 48kHz, 16-bit, stereo = 192000 bytes/sec
                  buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
@@ -336,7 +348,7 @@ index faed8108c71..4bb562b0706 100644
                      user_id = ssrc_user_map.get(ssrc, 0)
                      if not user_id:
                          user_id = self._infer_user_for_ssrc(ssrc)
-@@ -920,6 +1128,8 @@ class VoiceReceiver:
+@@ -1170,6 +1383,8 @@ class VoiceReceiver:
                          completed.append((user_id, bytes(buf)))
                  self._buffers.pop(ssrc, None)
                  self._last_packet_time.pop(ssrc, None)
@@ -344,10 +356,10 @@ index faed8108c71..4bb562b0706 100644
 +                self._released_at.pop(ssrc, None)
          return completed
  
-     # --- PCM -> WAV conversion (for Whisper STT) ---
-@@ -3570,7 +3780,15 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
-             if source is not None:
-                 self._voice_sources[guild_id] = source
+     def discard_pending(self) -> None:
+@@ -3805,7 +4020,15 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
+             self._reset_voice_timeout(guild_id)
+             self._bind_voice_text_channel(guild_id, text_channel_id, source)
              try:
 -                receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
 +                receiver = VoiceReceiver(
@@ -362,7 +374,7 @@ index faed8108c71..4bb562b0706 100644
                  receiver.start()
                  self._voice_receivers[guild_id] = receiver
                  self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
-@@ -3848,9 +4066,23 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+@@ -4051,9 +4274,23 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
              from tools.transcription_tools import transcribe_audio
              result = await asyncio.to_thread(transcribe_audio, wav_path)
              if not result.get("success"):
@@ -386,8 +398,8 @@ index faed8108c71..4bb562b0706 100644
 +                    user_id, transcript[:60])
                  return
              logger.info("Voice input from user %d: %s", user_id, transcript[:100])
-             if self._voice_input_callback:
-@@ -4413,6 +4645,114 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+             if getattr(self, "_voice_text_channels", {}).get(guild_id) != captured_for:
+@@ -4558,6 +4795,114 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                  _handler = discord.app_commands.choices(**choices)(_handler)
          return _handler
  
@@ -502,7 +514,7 @@ index faed8108c71..4bb562b0706 100644
      def _register_thread_slash(self, tree, name: str, description: str) -> None:
          @tree.command(name=name, description=description)
          @discord.app_commands.describe(
-@@ -4486,6 +4826,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+@@ -4637,6 +4982,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
          except Exception as e:
              logger.warning("Discord auto-register from plugin commands failed: %s", e)
          self._register_skill_group(tree)

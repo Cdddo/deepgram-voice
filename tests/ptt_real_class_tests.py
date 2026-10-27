@@ -35,8 +35,10 @@ def make_receiver(ptt=True, secret=b"k" * 32, dave=False):
     r._vc = None
     r._allowed_user_ids = {"42"}
     r._running = True  # _on_packet bails immediately otherwise
-    r._secret_key = secret
-    r._dave_session = None
+    # Upstream (2026-10-16) moved decryption state into the `_creds` tuple
+    # (secret_key, dave_session, dave_protocol_version, dave_downgraded);
+    # `_secret_key` / `_dave_session` became read-only properties over it.
+    r._creds = (secret, None, 0, False)
     r._bot_ssrc = 999
     r._ssrc_to_user = {}
     r._lock = threading.Lock()
@@ -55,6 +57,15 @@ def make_receiver(ptt=True, secret=b"k" * 32, dave=False):
     r._speaking_active = {}
     r._released_at = {}
 
+    # Upstream (2026-10-16) decode-health counters the packet path touches;
+    # real __init__ sets them, minimal init must mirror it.
+    r._rx_stats = {"ok": 0, "decrypt_fail": 0, "dave_fail": 0, "opus_err": 0}
+    r._decode_ok = 0
+    r._decode_failed = 0
+    r._dave_unmapped_dropped = 0
+    r._nacl_fail_streak = 0
+    r._dave_passthrough_until = 0.0
+
     # stub the decode + NaCl path: _on_packet calls nacl.secret.Aead.decrypt
     # via import — patch _secret_key decrypt by replacing _on_packet's decrypt
     # dependency: easier to monkeypatch nacl import? No — simplest: craft the
@@ -65,8 +76,8 @@ def make_receiver(ptt=True, secret=b"k" * 32, dave=False):
 def wire_real_decrypt(r):
     """Use a REAL nacl box so _on_packet's decrypt path works unmodified."""
     import nacl.secret
-    r._secret_key = b"k" * 32
-    return nacl.secret.Aead(r._secret_key)
+    r._creds = (b"k" * 32, r._creds[1], r._creds[2], r._creds[3]) if hasattr(r, "_creds") else (b"k" * 32, None, 0, False)
+    return nacl.secret.Aead(r._creds[0])
 
 
 def encrypt_packet(box, ssrc, payload=b"\x00" * 64):
